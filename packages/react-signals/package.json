@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/core/index.ts",
-    "./tracing": "./src/tracing/index.ts"
+    "./tracing": "./src/tracing/index.ts",
+    "./graphviz": "./src/graphviz/index.ts"
   },
   "scripts": {
     "test": "vitest run",

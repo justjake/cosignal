@@ -50,6 +50,8 @@ export type AtomOptions<T> = {
   effect?: (ctx: AtomCtx<T>) => void | (() => void);
   /** Defaults to Object.is. */
   isEqual?: (a: T, b: T) => boolean;
+  /** Debug label shown by tracing and the graphviz visualizers. */
+  name?: string;
 };
 
 export type ComputedCtx<T> = {
@@ -67,6 +69,8 @@ export type ComputedOptions<T> = {
   fn: (ctx: ComputedCtx<NoInfer<T>>) => T;
   /** Defaults to Object.is. */
   isEqual?: (a: T, b: T) => boolean;
+  /** Debug label shown by tracing and the graphviz visualizers. */
+  name?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +147,7 @@ export class Atom<T> {
       options.state,
       options.isEqual as ((a: unknown, b: unknown) => boolean) | undefined,
       options.effect !== undefined ? options : null,
+      options.name,
     );
     const self = this;
     this.lifecycleCtx = {
@@ -185,6 +190,7 @@ export class Computed<T> {
     this.node = createComputedNode(
       options.fn as (ctx: unknown) => unknown,
       options.isEqual as ((a: unknown, b: unknown) => boolean) | undefined,
+      options.name,
     );
   }
 

@@ -171,6 +171,8 @@ export type WriteEntry = {
 };
 
 export type AtomNode = Node & {
+  /** Debug label (Atom `name` option); used by tracing and visualizers. */
+  name: string | null;
   /** BASE-plane value as of the last pull (alien-signals `currentValue`). */
   value: unknown;
   /** BASE-plane latest write, committed to `value` lazily on pull. */
@@ -193,6 +195,8 @@ export const STATUS_ERROR = 1;
 export const STATUS_SUSPENDED = 2;
 
 export type ComputedNode = Node & {
+  /** Debug label (Computed `name` option); used by tracing and visualizers. */
+  name: string | null;
   value: unknown;
   /** STATUS_* for the BASE-plane result. */
   status: number;
@@ -1687,6 +1691,7 @@ export function createAtomNode(
   initial: unknown,
   isEqual: ((a: unknown, b: unknown) => boolean) | undefined,
   lifecycle: unknown,
+  name?: string,
 ): AtomNode {
   return {
     kind: KIND_ATOM,
@@ -1696,6 +1701,7 @@ export function createAtomNode(
     depsTail: undefined,
     subs: undefined,
     subsTail: undefined,
+    name: name ?? null,
     value: initial,
     buffered: initial,
     baseSeq: 0,
@@ -1710,6 +1716,7 @@ export function createAtomNode(
 export function createComputedNode(
   fn: (ctx: unknown) => unknown,
   isEqual: ((a: unknown, b: unknown) => boolean) | undefined,
+  name?: string,
 ): ComputedNode {
   return {
     kind: KIND_COMPUTED,
@@ -1719,6 +1726,7 @@ export function createComputedNode(
     depsTail: undefined,
     subs: undefined,
     subsTail: undefined,
+    name: name ?? null,
     value: undefined,
     status: STATUS_VALUE,
     payload: undefined,

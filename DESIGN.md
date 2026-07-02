@@ -52,50 +52,77 @@ These three, plus the (unrelated) DOM-mutation window, define the React patch
 Signal state lives in the graph nodes (single storage, not copied per
 subscriber). Each atom holds:
 
-- `committedValue` — the value all *committed* React trees agree on.
-- a small **write log**: entries `{value, lane, seq, committedEpoch?}` created
-  only when React bindings are active. `lane` is the opaque update lane React
-  assigned to the write's broadcast; `seq` is a global monotonic write counter;
-  `committedEpoch` is set when the write folds into committed state.
+- a committed value — the value every React tree that has finished committing
+  agrees on;
+- a small **write log**: a list of recent writes, created only while React
+  bindings are active. Think of it as a receipt tape. Each entry records:
+  - the written `value`;
+  - the `lane` React assigned to the write (which "priority channel" the
+    write's re-renders ride on — a transition lane, the urgent/sync lane,
+    and so on);
+  - `seq` — a ticket number from a global take-a-number counter, so every
+    write in the whole program has a position in one shared timeline;
+  - `foldedAtSeq` — zero while the write is still pending, and stamped with a
+    fresh ticket number at the moment the write becomes part of committed
+    state (when React commits it, see "Folding" below).
 
-Fast path: when no transition/concurrent work is pending, the log is empty and
-atoms are just `committedValue` — pure-core users (and the benchmark) never pay
-for worlds.
+Fast path: when no transition or concurrent work is pending, the log is empty
+and an atom is just its value — pure-core users (and the benchmark) never pay
+for any of this.
 
-### Read rule
+### The read rule
 
 Every read resolves against a **read context**:
 
-- **Head** (no context — writes/reads outside render, core effects,
-  benchmarks): fold the whole log; i.e. the latest write wins. Matches the
-  benchmark contract "reads mid-batch see fresh values".
-- **Render** (inside a React render pass with lanes `R`, pinned at pass start
-  with `pin = {epoch, maxSeq}`): value = `committedValue` as of `pin.epoch`,
-  overlaid with log writes that are **uncommitted ∧ lane ∈ R ∧ seq ≤
-  pin.maxSeq**.
+- **Outside render** (event handlers, core effects, benchmarks): newest write
+  wins, always. This matches the benchmark contract "reads mid-batch see
+  fresh values".
+- **During a render pass**: at the moment the pass starts, the bindings note
+  the current ticket number — the pass's **pin**. For the rest of that pass
+  (even if React pauses it and resumes later), an atom read returns the value
+  of the newest log entry that passes either test:
+  1. **It already committed, before this pass started.** (Its `foldedAtSeq`
+     stamp is at or below the pin.)
+  2. **This render is rendering its lane, and the write existed when the pass
+     started.** (Its lane is one of the render's lanes, and its `seq` ticket
+     is at or below the pin.)
 
-This reproduces React's own update-queue semantics for graph reads:
+  If no entry qualifies, the read falls back to the value from before the
+  oldest retained entry.
 
-- lane ∈ R ⇔ React would apply this update in this render.
-- seq ≤ pin.maxSeq ⇔ the write existed when the render pass started — mirrors
-  `finishQueueingConcurrentUpdates`, which hides mid-render arrivals from the
-  in-progress pass.
-- epoch pinning keeps a *yielded* render reading the same committed base even
-  if another root commits (and folds) meanwhile. Old committed values are
-  retained (per-atom mini-history) only while some active render pins an older
-  epoch — races are rare and renders are short, so history is transient.
+Each clause mirrors something React itself does with its hook update queues:
+
+- Clause 2's lane test is exactly React's rule for which queued `setState`
+  updates apply in a given render: a render at transition priority applies
+  transition updates and skips urgent ones, and vice versa.
+- Both clauses' "before the pass started" tests mirror
+  `finishQueueingConcurrentUpdates`: updates that arrive while a render is in
+  progress are hidden from that render and picked up by the next one.
+- Clause 1 using the *fold time* rather than the *write time* is what keeps a
+  paused-and-resumed render consistent: if some other root commits (and folds
+  a write) while this render is paused, the fold's stamp is above this pass's
+  pin, so this pass keeps reading the value it started with. Old values are
+  retained only while some active pass could still need them — races are rare
+  and renders are short, so the retained history is transient.
 
 ### Folding
 
-On each root commit (patch callback with committed + remaining lanes):
+"Folding" is how a pending write becomes committed state. On each root commit
+(the patch tells us which lanes committed and which are still pending):
 
-- log writes whose lane committed → `committedValue = value`, stamp
-  `committedEpoch`, bump the global epoch;
-- log writes whose lane is no longer pending in any root that received its
-  broadcast → fold too (the work was discarded, e.g. unmounted subtree; head
-  semantics must still converge);
-- entries fold immediately at write time when nothing subscribed (no broadcast
-  → nothing will ever commit them).
+- log entries whose lane just committed get their `foldedAtSeq` stamp, and the
+  newest of them becomes the atom's committed value — unless a newer write is
+  already part of committed state. Committed state is strictly
+  last-write-wins in write order: each atom remembers the ticket number of the
+  write it currently reflects (`baseSeq`), and a fold never rolls it back to
+  an older write. (Without this guard, committing an old transition after a
+  newer urgent write would resurrect the stale value — a confirmed bug during
+  review, now a regression test.)
+- entries whose lane is no longer pending in any root we know about fold too:
+  the work was discarded (say, the only subscriber unmounted), but the write
+  still happened, so committed state must still converge to it;
+- writes made while nothing at all is subscribed fold immediately — no render
+  will ever commit them, and pure-core semantics must not change.
 
 Multi-root note: lanes are per-root but transition lanes are claimed from a
 module-global cursor and all pending transition lanes render as **one batch**
@@ -103,17 +130,32 @@ in today's React (`getHighestPriorityLanes`; `enableParallelTransitions` off —
 notes/research/react-lanes-transitions.md §10). v1 folds a write when the first
 root commits its lane; other roots' urgent renders may briefly observe the new
 committed value before their own transition commit lands. Their in-progress
-passes are protected by epoch pins; the relaxation is documented and a
-refcounted fold (wait for all broadcast-target roots) is a contained upgrade.
+passes are protected by their pins (the fold-time stamp is above the pin); the
+relaxation is documented and a refcounted fold (wait for all broadcast-target
+roots) is a contained upgrade.
 
 ### Rebasing
 
 Because atoms are last-write-wins, the interleaving that forces
 react-concurrent-store to re-run reducers ("sync write while a transition is
-pending") needs no special machinery: a sync write appends a sync-lane log
-entry; a sync render reads committed+sync-entry; the transition render later
-reads committed+both entries (transition lanes ∪ rebased base) — each render's
-lane filter produces exactly React's rebase result.
+pending") needs no special machinery. Walk it through with `a` written by a
+transition and `b` written urgently while that transition is still pending:
+
+| log entry | lane | pending or committed? |
+|---|---|---|
+| `a = 1` | transition | pending |
+| `b = 1` | sync (urgent) | pending, commits first |
+
+- The **urgent render** renders sync lanes: it sees `b = 1` (clause 2) but not
+  `a = 1` (transition lane not included) — the screen updates with the urgent
+  change only, transition still invisible. React commits it; `b`'s entry
+  folds.
+- The **transition render** afterwards sees `a = 1` (its own lane, clause 2)
+  *and* `b = 1` (already folded, clause 1) — the transition lands on top of
+  the urgent change, never wiping it out.
+
+Each render's lane filter produces exactly the result React's own update-queue
+rebasing would produce for `useState`.
 
 ## 3. Core graph (`src/core`, zero React imports)
 
@@ -235,6 +277,21 @@ tracer into the core slot; a ring buffer plus subscription API feed the future
 devtools timeline; helpers answer "why did X re-run" by walking cause chains.
 Zero overhead unless loaded (single null check per site).
 
+Two visualizer helpers live in a further-separate module,
+`react-signals/graphviz`, which emits Graphviz DOT source (render it with
+`dot -Tsvg` or any Graphviz viewer — DOT handles graph sizes that crash
+Mermaid renderers):
+
+- `dependencyGraphToDot(signals)` — a snapshot of the live dependency graph
+  reachable from the given signals: atoms, computeds, watchers, per-plane
+  values while forked, stale flags, and which plane each edge belongs to.
+- `traceToDot(events)` — a causal graph of tracing events (write → eval →
+  notify → effect chains), filterable by event type.
+
+The module layering is strict: `tracing` installs and records events without
+loading any visualizer code, and `graphviz` imports only *types* from tracing,
+so either can load without the other.
+
 ## 6. React patch (vendor/react, minimal)
 
 Two independent features, both following the established
@@ -319,3 +376,264 @@ the bracket to cover them.
   sync re-renders, no per-render allocations in uSES's style.
 - Target: within noise of `useState` for re-render-on-change; alien-signals
   -class results on the core benchmark.
+
+## 9. Walkthrough: how a computed works under concurrent rendering
+
+This section re-explains the machinery above in plain language, following one
+computed through its life. It adds no new rules — everything here is §2 and §3
+again, slower and with pictures. Code references are into
+`packages/react-signals/src/core/engine.ts`.
+
+### 9.1 A computed is a cache with sticky notes
+
+A `Computed` stores the answer from the last time its function ran, plus two
+"sticky note" flags:
+
+- **definitely stale** (`Dirty`): a value it directly reads has changed; the
+  next read must re-run the function.
+- **maybe stale** (`Pending`): something *somewhere upstream* changed; the
+  next read must first check whether the change actually reached us.
+
+Writing an atom doesn't compute anything. It just walks downstream through the
+dependency edges putting "maybe stale" notes on everything it can reach
+(`propagate`). The work happens on *read*: a read that finds a "maybe stale"
+note walks *upstream* (`checkDirty`), re-running only the upstream computeds
+that truly changed. If some upstream computed re-runs and produces the same
+answer as before (checked with `isEqual`), the staleness stops there — nothing
+below it re-runs. That's the "equality cutoff", and it's why
+`parity = count % 2` doesn't re-render anything when `count` goes from 1 to 3.
+
+So far this is a completely ordinary signals library. Concurrency is where it
+stops being ordinary.
+
+### 9.2 The problem: React needs several "presents" at once
+
+Say `count` is 1 and a transition writes `count = 5`. Until that transition
+commits, React is living in two moments at once:
+
+- The screen (and any urgent render that happens meanwhile) must keep acting
+  like `count` is 1.
+- The transition render must act like `count` is 5.
+
+A computed with **one** cached value cannot serve both. So while any
+transition write is pending, the engine splits — "forks" — into two **planes**
+(two parallel sets of values and sticky notes over the same graph):
+
+- **BASE**: committed state plus pending *urgent* writes. Urgent renders and
+  effects read this.
+- **HEAD**: every write including pending transitions. Transition renders and
+  non-render reads (event handlers) read this.
+
+```mermaid
+flowchart LR
+    A["Steady state<br/>one plane<br/>count = 1"]
+    subgraph FORKED["Forked (a transition write is pending)"]
+        B["BASE plane<br/>what the screen shows<br/>count = 1"]
+        H["HEAD plane<br/>everything, including the transition<br/>count = 5"]
+    end
+    C["Steady state again<br/>one plane<br/>count = 5"]
+    A -- "startTransition writes count = 5" --> FORKED
+    FORKED -- "React commits the transition ('fold')" --> C
+```
+
+The fork is temporary. When React commits the transition, the pending writes
+"fold" into committed state, the two planes agree again, and the engine goes
+back to being a plain single-plane signals library. Code that never uses
+transitions (or never uses React at all) never forks — that's why the
+benchmark numbers stay close to alien-signals.
+
+A forked computed carries one result per plane (`value` / `headValue`, plus a
+status and error/promise slot for each) and one set of sticky notes per plane
+(`Pending`/`Dirty` for BASE, `HeadPending`/`HeadDirty` for HEAD). A transition
+write puts notes only in the HEAD set; an urgent write puts notes in both,
+because an urgent write is part of both worlds' futures.
+
+### 9.3 Even the dependency edges are per-plane
+
+Here's the trap that makes this harder than "keep two values". A computed's
+dependencies come from whatever its function *actually reads*, and the two
+planes can make it read different things:
+
+```ts
+const c = new Computed({
+  fn: () => (a.state <= 1 ? b.state : 0),
+});
+```
+
+With committed `a = 1` and a pending transition `a = 2`:
+
+```mermaid
+flowchart TD
+    a["Atom a<br/>BASE: 1&nbsp;&nbsp;HEAD: 2"]
+    b["Atom b<br/>5"]
+    c["Computed c<br/>BASE: reads a then b, result 5<br/>HEAD: reads a only, result 0"]
+    a -->|"edge exists in BASE and HEAD"| c
+    b -->|"edge exists in BASE only"| c
+```
+
+In the HEAD world, `a` is 2, the condition is false, and `c` never touches
+`b` — so in that world there is no `b → c` edge at all. But in the BASE world
+`c` very much depends on `b`: if an urgent write changes `b`, the *screen's*
+version of `c` must update, even though the transition's version doesn't care.
+
+If edges were shared between planes, whichever plane evaluated last would
+erase the other plane's edges, and one of those updates would be silently
+lost. So every edge (`Link`) carries two membership bits — "this edge exists
+in BASE" / "this edge exists in HEAD" — and an evaluation only rewrites its
+own plane's bits. A write follows only the edges that exist in the plane(s)
+it is writing to. (This exact scenario is a regression test:
+`test/core.test.ts`, "dependency sets can differ between planes without
+missing updates".)
+
+### 9.4 The head result is created lazily — and suspiciously
+
+Forking doesn't eagerly copy anything. The first time someone reads a
+computed's HEAD result during a fork, the engine "seeds" it from the BASE
+result (`seedHead`), on the theory that before the fork both worlds were the
+same — and then lets the normal sticky notes decide whether that seed is
+already stale (the transition's write marked everything downstream of it).
+
+The one thing the seed must never trust: a BASE result that was computed
+*during* the current fork. That result deliberately excluded the transition's
+writes, so it is not "the shared state from before the fork" — seeding HEAD
+from it would hand the transition render pre-transition values. Each computed
+remembers which fork generation last recomputed its BASE result (`baseGen`);
+if that matches the current fork, the seed is skipped and the HEAD result is
+computed from scratch. (Found by the adversarial review; also a regression
+test now.)
+
+### 9.5 What actually happens when a component reads a computed
+
+`useSignal` never asks for "the current value". At the start of every render
+pass, a callback from the React patch creates a **render world** for the pass:
+the pass's lanes plus a pin (the write-ticket number at that instant, §2). All
+reads in that pass resolve against that world, and the world never changes for
+the life of the pass — even if React pauses the render and resumes it later.
+
+```mermaid
+flowchart TD
+    R["Component calls useSignal(computed)<br/>during a render"] --> W["Look up this render pass's world:<br/>which lanes + the pin"]
+    W --> Q{"Since this pass pinned:<br/>has any value changed?<br/>is any pending write excluded<br/>by this render's lanes?"}
+    Q -->|"no (the common case)"| FAST["Fast path:<br/>read the live plane that matches —<br/>BASE for urgent renders,<br/>HEAD for transition renders"]
+    Q -->|yes| PURE["Pure evaluation against the pinned world:<br/>run the function with atom reads answered<br/>by the write-log rule from §2;<br/>cache the answer on the node, keyed by this pass"]
+```
+
+Two things about the slow ("pure") path are worth spelling out:
+
+- **The per-pass cache never needs re-checking.** The pin makes the world
+  immutable: writes that land mid-pass have ticket numbers above the pin, and
+  folds that happen mid-pass have fold stamps above the pin, so neither can
+  change what this pass is allowed to see. One evaluation per computed per
+  pass is correct by construction. When the last active pass ends, these
+  caches are dropped.
+- **The pure path creates no graph edges.** React is allowed to throw a
+  render away (that's the whole point of concurrent rendering). If a
+  `useComputed` node from a discarded render had linked itself into the
+  graph, it would sit in some atom's subscriber list forever — a leak. Pure
+  evaluations leave no trace; a computed only gets wired into the graph when
+  its component actually commits and subscribes.
+
+A pleasant consequence of reading through the render world: a component that
+*mounts inside a transition render* simply reads the transition's values,
+because that's what its render's world contains. The same situation is the
+one react-concurrent-store's authors document as impossible to fix from
+userland (their readers must guess, render twice, and can still get stuck in
+a suspense fallback). Here it needs no special case at all.
+
+### 9.6 How a write turns into re-renders
+
+When an atom is written, three strictly ordered phases run — all before the
+write call returns, which is the entire trick for transition integration:
+
+```mermaid
+sequenceDiagram
+    participant H as Event handler
+    participant E as Engine
+    participant S as Subscription (one per useSignal)
+    participant R as React
+    H->>E: startTransition(() => { count.state = 5 })
+    Note over E: Phase 1 — mark:<br/>walk downstream, leave "maybe stale"<br/>notes (HEAD plane), queue watchers.<br/>No user code runs.
+    Note over E: Phase 2 — confirm:<br/>for each queued subscription, pull the<br/>watched computed in the written plane.<br/>Equality cutoff applies here.
+    E->>S: confirmed: your computed really changed
+    S->>R: setState (version bump) — still inside startTransition!
+    Note over R: React assigns the transition lane,<br/>schedules a transition render.
+    Note over E: Phase 3 — effects flush<br/>(unless batching or mid-evaluation).
+```
+
+- Because phase 2 runs while the write call is still on the stack — inside
+  the user's `startTransition` — React gives the resulting `setState` the
+  same lane it would give any `setState` written next to the signal write.
+  That's the whole integration: no lane plumbing, just careful timing.
+- Confirmation is per-plane. A forked urgent write might change a computed's
+  BASE answer while its HEAD answer stays the same (or the reverse); each
+  marked plane is checked separately, so exactly the right renders get
+  scheduled and no more.
+- The phase order is load-bearing. An early version confirmed subscriptions
+  *during* the marking walk, and the first subscriber's pull would clear the
+  atom's "changed" flag before its sibling subscribers had even been marked —
+  one component re-rendered, the other silently never did. All three
+  adversarial reviewers found versions of this; the strict
+  mark-everything-first protocol is now documented as an invariant at the top
+  of `engine.ts` and covered by regression tests.
+
+### 9.7 Commit: fold, effects, reconverge
+
+When React commits a render, the patch reports which lanes committed. Log
+entries on those lanes fold into committed state (§2), and if no pending
+transition writes remain, the planes reconverge — the fork is over.
+
+Folding re-runs **effect** watchers (`useSignalEffect`, core `effect`),
+because their world — committed state — just changed. It deliberately does
+*not* notify component subscriptions: the components that cared were already
+notified back in phase 2 at write time, and have either rendered those values
+or have the render queued. Notifying them again would schedule a wasted
+re-render of things already on screen.
+
+This is also why `useSignalEffect` never sees a transition's values early:
+effects re-run when the transition *commits*, matching `useEffect`'s
+after-commit timing.
+
+### 9.8 Suspense: a promise is just a third kind of answer
+
+Inside a computed, `ctx.use(promise)` doesn't throw an exception through the
+graph. Evaluation always completes with one of three results, stored like any
+cached value:
+
+| status | stored payload | what a reader gets |
+|---|---|---|
+| value | the value | the value |
+| error | the thrown error | the error is re-thrown |
+| suspended | the pending promise | a `SuspendedRead` carrying that promise |
+
+`useSignal` catches `SuspendedRead` and hands the promise to React's `use()`,
+so React's own suspense machinery does the waiting and replaying. Because the
+status is per-plane, a computed can be a plain value in BASE while suspended
+in HEAD — which is exactly the "transition into a loading state" case: the
+screen keeps the old content (BASE has a value; no fallback appears) while
+the transition render waits on the pending world's promise.
+
+### 9.9 The whole story in one interleaving
+
+This is the scenario from `test/react-hooks.test.tsx` ("urgent update
+interleaving a pending transition"), with `sum = a + b * 100`, both atoms
+starting at 0:
+
+| step | what happens | log (lane, state) | screen shows |
+|---|---|---|---|
+| 1 | transition writes `a = 1`, held open | `a=1` (transition, pending) | `0` |
+| 2 | engine forks; sum: BASE 0, HEAD 1; subscription confirmed in HEAD → transition render scheduled | | `0` |
+| 3 | urgent write `b = 1` | + `b=1` (sync, pending) | `0` |
+| 4 | urgent render: its world includes sync, excludes transition → sees `b` only → sum 100; commits; `b` folds | `b=1` folded | `100` |
+| 5 | transition resolves; transition render: its world includes its own lane (`a=1`) and everything folded (`b=1`) → sum 101; commits; `a` folds; planes reconverge | log empty | `101` |
+
+At no point does any render see the torn combinations (`1` or a stale `0`
+after step 4), and the urgent change is never wiped out by the older
+transition — the same guarantees React gives two `useState` hooks, extended
+to shared derived state.
+
+### 9.10 Seeing it live
+
+`react-signals/graphviz` renders both halves of this story from a running
+app: `dependencyGraphToDot` snapshots the graph (per-plane values, stale
+flags, per-plane edges), and `traceToDot` turns a tracing session's events
+into the causal chain a write followed. See §5.
