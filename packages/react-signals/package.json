@@ -1,0 +1,29 @@
+{
+  "name": "react-signals",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./tracing": "./src/tracing/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-dom": "*"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "jsdom": "^29.1.1",
+    "react": "link:../../vendor/react/build/oss-experimental/react",
+    "react-dom": "link:../../vendor/react/build/oss-experimental/react-dom",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.0"
+  }
+}
