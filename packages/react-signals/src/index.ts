@@ -9,6 +9,7 @@
 export {
   Atom,
   Computed,
+  ReducerAtom,
   effect,
   batch,
   configure,
@@ -24,11 +25,14 @@ export type {
   AtomCtx,
   ComputedOptions,
   ComputedCtx,
+  ReducerAtomOptions,
   Signal,
   ConfigureOptions,
 } from './core/index.ts';
 
 export { useSignal } from './react/useSignal.ts';
-export { useComputed } from './react/useComputed.ts';
+export { useComputed, type UseComputedOptions } from './react/useComputed.ts';
 export { useSignalEffect } from './react/useSignalEffect.ts';
+export { useAtom, useReducerAtom, type UseAtomOptions } from './react/useAtom.ts';
+export { startSignalTransition } from './react/runtime.ts';
 export { observeMutationsExceptReact } from './react/dom.ts';

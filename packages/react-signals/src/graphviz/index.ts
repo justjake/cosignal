@@ -68,11 +68,11 @@ function nodeDisplayName(node: Node | undefined): string {
   if (node === undefined) return '';
   if (node.kind === KIND_ATOM) {
     const atom = node as AtomNode;
-    return atom.name !== null ? `Atom ${atom.name}` : 'Atom';
+    return atom.label !== null ? `Atom ${atom.label}` : 'Atom';
   }
   if (node.kind === KIND_COMPUTED) {
     const c = node as ComputedNode;
-    return c.name !== null ? `Computed ${c.name}` : 'Computed';
+    return c.label !== null ? `Computed ${c.label}` : 'Computed';
   }
   const w = node as WatcherNode;
   return w.watcherKind === WATCHER_EFFECT ? 'effect' : 'subscription';

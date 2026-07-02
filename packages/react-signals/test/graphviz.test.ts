@@ -14,8 +14,8 @@ afterEach(() => {
 
 describe('dependencyGraphToDot', () => {
   test('renders atoms, computeds, watchers, and edges with names', () => {
-    const count = new Atom({ state: 1, name: 'count' });
-    const double = new Computed({ fn: () => count.state * 2, name: 'double' });
+    const count = new Atom({ state: 1, label: 'count' });
+    const double = new Computed({ fn: () => count.state * 2, label: 'double' });
     const dispose = effect(() => {
       void double.state;
     });
@@ -34,8 +34,8 @@ describe('dependencyGraphToDot', () => {
   });
 
   test('walking from any signal reaches the same graph', () => {
-    const a = new Atom({ state: 1, name: 'a' });
-    const c = new Computed({ fn: () => a.state + 1, name: 'c' });
+    const a = new Atom({ state: 1, label: 'a' });
+    const c = new Computed({ fn: () => a.state + 1, label: 'c' });
     void c.state; // evaluate to establish the link
     const fromAtom = dependencyGraphToDot([a]);
     const fromComputed = dependencyGraphToDot([c]);
@@ -46,16 +46,16 @@ describe('dependencyGraphToDot', () => {
   });
 
   test('while forked, shows both planes and per-plane edges', () => {
-    const a = new Atom({ state: 1, name: 'a' });
-    const b = new Atom({ state: 5, name: 'b' });
+    const a = new Atom({ state: 1, label: 'a' });
+    const b = new Atom({ state: 5, label: 'b' });
     // Depends on b only while a is 1 or less — dep sets differ per plane.
-    const c = new Computed({ fn: () => (a.state <= 1 ? b.state : 0), name: 'c' });
+    const c = new Computed({ fn: () => (a.state <= 1 ? b.state : 0), label: 'c' });
     const dispose = effect(() => {
       void c.state;
     });
 
     setWriteLaneProvider(() => ({ lane: 2, transition: true }));
-    a.state = 2; // fork; HEAD drops the b -> c edge on next head eval
+    a.set(2); // fork; HEAD drops the b -> c edge on next head eval
     setWriteLaneProvider(null);
     expect(isForked()).toBe(true);
     void a.state; // head read; re-evaluates c in HEAD without b
@@ -71,13 +71,13 @@ describe('dependencyGraphToDot', () => {
 describe('traceToDot', () => {
   test('renders cause chains as edges', () => {
     session = enableTracing();
-    const a = new Atom({ state: 1, name: 'a' });
-    const c = new Computed({ fn: () => a.state * 2, name: 'c' });
+    const a = new Atom({ state: 1, label: 'a' });
+    const c = new Computed({ fn: () => a.state * 2, label: 'c' });
     const dispose = effect(() => {
       void c.state;
     });
     session.clear();
-    a.state = 2;
+    a.set(2);
 
     const dot = traceToDot(session.events());
     expect(dot).toContain('digraph trace {');
@@ -91,13 +91,13 @@ describe('traceToDot', () => {
 
   test('filtering keeps chains connected by routing through hidden events', () => {
     session = enableTracing();
-    const a = new Atom({ state: 1, name: 'a' });
-    const c = new Computed({ fn: () => a.state * 2, name: 'c' });
+    const a = new Atom({ state: 1, label: 'a' });
+    const c = new Computed({ fn: () => a.state * 2, label: 'c' });
     const dispose = effect(() => {
       void c.state;
     });
     session.clear();
-    a.state = 2;
+    a.set(2);
 
     const events = session.events();
     const dot = traceToDot(events, { includeTypes: ['atom-write', 'effect-run'] });

@@ -91,9 +91,9 @@ describe('finding 1: subscription watcher dies after suspense settle', () => {
       // But the muted propagate left F.Pending|F.HeadPending set on w
       // (notifyWatcher returns before confirmSubscriptionDirty when muted),
       // so every future propagate sees `alreadyMarked` and prunes at w.
-      a.state = 5; // genuine change: c is now 15 — subscriber must hear it
+      a.set(5); // genuine change: c is now 15 — subscriber must hear it
       expect(calls.length).toBe(1); // FAILS: 0 — notification lost forever
-      a.state = 6;
+      a.set(6);
       expect(calls.length).toBe(2);
     } finally {
       disposeWatcher(w);
@@ -110,10 +110,10 @@ describe('finding 2: same-atom transition+urgent fold order', () => {
   test('urgent write is not clobbered by a later transition fold', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2; // transition write (older)
+      a.set(2); // transition write (older)
     });
     withLane(LANE_SYNC, false, () => {
-      a.state = 3; // urgent write (newer) — head world is 3
+      a.set(3); // urgent write (newer) — head world is 3
     });
     expect(a.state).toBe(3); // head read
     fold((e) => e.lane === LANE_SYNC); // sync commit
@@ -135,7 +135,7 @@ describe('finding 3: computed first-evaluated while forked', () => {
   test('head-first eval: BASE read must not return undefined', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2; // fork
+      a.set(2); // fork
     });
     const c = new Computed({ fn: () => a.state * 10 });
     expect(c.state).toBe(20); // untracked read while forked → HEAD plane; ok
@@ -153,7 +153,7 @@ describe('finding 3: computed first-evaluated while forked', () => {
   test('base-first eval: HEAD read must see the transition value', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2; // fork; head a=2, base a=1
+      a.set(2); // fork; head a=2, base a=1
     });
     const c = new Computed({ fn: () => a.state * 10 });
     const seen: unknown[] = [];
@@ -185,7 +185,7 @@ describe('finding 4: second head subscriber misses an atom head change', () => {
     expect(c1.state).toBe(10);
     expect(c2.state).toBe(100);
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     // Pulling c1 in HEAD clears the atom's HeadDirty bit; the BASE branch of
     // checkDirty shallowPropagates to the atom's other subscribers, the HEAD
@@ -206,12 +206,12 @@ describe('finding 5: stale-link cycle false positive', () => {
     const c = new Computed({
       fn: () => {
         if (gate.state) return b.state; // run 1 reads b
-        b.state = 99; // run 2 writes b WITHOUT reading it (dep set shrank)
+        b.set(99); // run 2 writes b WITHOUT reading it (dep set shrank)
         return 1;
       },
     });
     expect(c.state).toBe(0);
-    gate.state = false;
+    gate.set(false);
     // The stale link b→c from run 1 is still in b's subscriber list mid-run-2
     // (pruned only at endTracking); propagate's `sub === cycleGuard` check has
     // no isValidLink-style "read so far this run" validation → throws.
@@ -228,7 +228,7 @@ describe('finding 6: pinned render pass vs mid-pass fold', () => {
   test('a pinned pass excluding lane T never sees T, even after fold', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     const pin = currentWriteSeq();
     pinRenderPass(pin);
@@ -270,10 +270,10 @@ describe('finding 7: dispose-cleanup reads leak into the disposing effect', () =
     });
     try {
       expect(runsA).toBe(1);
-      flag.state = true; // A re-runs, disposes B; B's cleanup runs while A is
+      flag.set(true); // A re-runs, disposes B; B's cleanup runs while A is
       // the activeSub with RecursedCheck set → x gets linked as a dep of A.
       expect(runsA).toBe(2);
-      x.state = 99; // must not re-run A (runEffect nulls activeSub around
+      x.set(99); // must not re-run A (runEffect nulls activeSub around
       // cleanups; disposeWatcher forgets to)
       expect(runsA).toBe(2); // FAILS: 3
     } finally {
@@ -307,7 +307,7 @@ describe('finding 8: suspended dep read by another computed', () => {
       // SuspendedRead instance instead of STATUS_SUSPENDED carrying the
       // thenable. Every re-evaluation makes a new SuspendedRead, so the
       // "unchanged" cutoff can never apply while suspended:
-      a.state = 1; // outer still suspends on the SAME promise → no real change
+      a.set(1); // outer still suspends on the SAME promise → no real change
       expect(calls.length).toBe(0); // FAILS: 2 (spurious notifies; payload is a
       // fresh SuspendedRead instance each eval so equality cutoff never holds)
       expect(outer.node.status).toBe(STATUS_SUSPENDED); // also fails: STATUS_ERROR
@@ -340,7 +340,7 @@ describe('finding 9: throwing isEqual corrupts computed state', () => {
       },
     });
     expect(c.state).toBe(1);
-    a.state = 2;
+    a.set(2);
     boom = true;
     // commitComputedResult runs OUTSIDE updateComputed's try/finally; the
     // throw escapes after flags were already cleared, so the node looks clean.
@@ -360,7 +360,7 @@ describe('sanity (no defect found)', () => {
     let runs = 0;
     const dispose = effect(() => {
       runs++;
-      if (a.state < 1) a.state = a.state + 1;
+      if (a.state < 1) a.set(a.state + 1);
     });
     expect(runs).toBe(1); // no synchronous re-entrant loop
     expect(a.state).toBe(1);
@@ -371,7 +371,7 @@ describe('sanity (no defect found)', () => {
     const a = new Atom({
       state: 0,
       effect: (ctx) => {
-        ctx.state = 42;
+        ctx.set(42);
       },
     });
     const seen: number[] = [];
@@ -395,7 +395,7 @@ describe('sanity (no defect found)', () => {
     const dispose = effect(() => void c.state);
     await tick();
     expect(log).toEqual(['mount']);
-    flag.state = false; // c drops a → a unwatched mid-flight
+    flag.set(false); // c drops a → a unwatched mid-flight
     await tick();
     expect(log).toEqual(['mount', 'unmount']);
     dispose();
@@ -412,10 +412,10 @@ describe('sanity (no defect found)', () => {
       },
     });
     expect(c.state).toBe(11);
-    b.state = 20; // untracked → no invalidation
+    b.set(20); // untracked → no invalidation
     expect(c.state).toBe(11);
     expect(evals).toBe(1);
-    a.state = 2;
+    a.set(2);
     expect(c.state).toBe(22);
   });
 

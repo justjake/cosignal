@@ -35,7 +35,7 @@ describe('atoms', () => {
   test('read and write', () => {
     const a = new Atom({ state: 1 });
     expect(a.state).toBe(1);
-    a.state = 2;
+    a.set(2);
     expect(a.state).toBe(2);
   });
 
@@ -49,9 +49,9 @@ describe('atoms', () => {
       log.push(a.state.v);
     });
     expect(log).toEqual([1]);
-    a.state = { v: 1 }; // equal per isEqual
+    a.set({ v: 1 }); // equal per isEqual
     expect(log).toEqual([1]);
-    a.state = { v: 2 };
+    a.set({ v: 2 });
     expect(log).toEqual([1, 2]);
   });
 });
@@ -65,7 +65,7 @@ describe('computeds', () => {
     expect(c.state).toBe(4);
     expect(c.state).toBe(4);
     expect(double.calls()).toBe(1); // cached
-    a.state = 3;
+    a.set(3);
     expect(double.calls()).toBe(1); // write does not eagerly recompute
     expect(c.state).toBe(6);
     expect(double.calls()).toBe(2);
@@ -75,9 +75,9 @@ describe('computeds', () => {
     const a = new Atom({ state: 1 });
     const c = new Computed({ fn: () => a.state * 10 });
     batch(() => {
-      a.state = 2;
+      a.set(2);
       expect(c.state).toBe(20);
-      a.state = 3;
+      a.set(3);
       expect(c.state).toBe(30);
     });
   });
@@ -88,10 +88,10 @@ describe('computeds', () => {
     const downstream = counted(() => parity.state * 100);
     const c = new Computed({ fn: downstream.fn });
     expect(c.state).toBe(100);
-    a.state = 3; // parity unchanged (1)
+    a.set(3); // parity unchanged (1)
     expect(c.state).toBe(100);
     expect(downstream.calls()).toBe(1);
-    a.state = 4; // parity changed (0)
+    a.set(4); // parity changed (0)
     expect(c.state).toBe(0);
     expect(downstream.calls()).toBe(2);
   });
@@ -103,7 +103,7 @@ describe('computeds', () => {
     const join = counted(() => left.state + right.state);
     const c = new Computed({ fn: join.fn });
     expect(c.state).toBe(12);
-    a.state = 2;
+    a.set(2);
     expect(c.state).toBe(23);
     expect(join.calls()).toBe(2);
   });
@@ -119,14 +119,14 @@ describe('computeds', () => {
       seen.push(c.state);
     });
     expect(seen).toEqual(['a']);
-    b.state = 'b2'; // not a dependency right now
+    b.set('b2'); // not a dependency right now
     expect(seen).toEqual(['a']);
     expect(pick.calls()).toBe(1);
-    which.state = false;
+    which.set(false);
     expect(seen).toEqual(['a', 'b2']);
-    a.state = 'a2'; // no longer a dependency
+    a.set('a2'); // no longer a dependency
     expect(seen).toEqual(['a', 'b2']);
-    b.state = 'b3';
+    b.set('b3');
     expect(seen).toEqual(['a', 'b2', 'b3']);
   });
 
@@ -139,7 +139,7 @@ describe('computeds', () => {
     });
     const c = new Computed({ fn: body.fn });
     expect(c.state).toBe(30);
-    a.state = 2;
+    a.set(2);
     expect(c.state).toBe(60);
     expect(body.calls()).toBe(2);
   });
@@ -154,7 +154,7 @@ describe('computeds', () => {
     expect(() => c.state).toThrow('boom');
     expect(() => c.state).toThrow('boom');
     expect(boom.calls()).toBe(1); // error result is cached
-    a.state = 5;
+    a.set(5);
     expect(c.state).toBe(5);
   });
 });
@@ -167,7 +167,7 @@ describe('effects', () => {
       seen.push(a.state);
     });
     expect(seen).toEqual([1]);
-    a.state = 2;
+    a.set(2);
     expect(seen).toEqual([1, 2]);
   });
 
@@ -178,8 +178,8 @@ describe('effects', () => {
     effect(() => void runs.fn());
     expect(runs.calls()).toBe(1);
     batch(() => {
-      a.state = 2;
-      b.state = 20;
+      a.set(2);
+      b.set(20);
     });
     expect(runs.calls()).toBe(2); // exactly one flush for the batch
   });
@@ -192,7 +192,7 @@ describe('effects', () => {
       log.push(`run ${v}`);
       return () => log.push(`clean ${v}`);
     });
-    a.state = 2;
+    a.set(2);
     dispose();
     expect(log).toEqual(['run 1', 'clean 1', 'run 2', 'clean 2']);
   });
@@ -202,7 +202,7 @@ describe('effects', () => {
     const b = new Atom({ state: 2 });
     const runs = counted(() => a.state);
     effect(() => void runs.fn());
-    b.state = 99;
+    b.set(99);
     expect(runs.calls()).toBe(1);
   });
 
@@ -211,8 +211,8 @@ describe('effects', () => {
     const runs = counted(() => a.state);
     effect(() => void runs.fn());
     batch(() => {
-      a.state = 2;
-      a.state = 1;
+      a.set(2);
+      a.set(1);
     });
     expect(runs.calls()).toBe(1);
   });
@@ -221,7 +221,7 @@ describe('effects', () => {
     const a = new Atom({ state: 1 });
     const runs = counted(() => untracked(() => a.state));
     effect(() => void runs.fn());
-    a.state = 2;
+    a.set(2);
     expect(runs.calls()).toBe(1);
   });
 });
@@ -233,13 +233,13 @@ describe('writes inside computeds', () => {
     const c = new Computed({
       fn: () => {
         const v = a.state * 2;
-        sideChannel.state = v; // write to an atom the computed doesn't read
+        sideChannel.set(v); // write to an atom the computed doesn't read
         return v;
       },
     });
     expect(c.state).toBe(2);
     expect(sideChannel.state).toBe(2);
-    a.state = 5;
+    a.set(5);
     expect(c.state).toBe(10);
     expect(sideChannel.state).toBe(10);
   });
@@ -249,7 +249,7 @@ describe('writes inside computeds', () => {
     const c = new Computed({
       fn: () => {
         const v = a.state;
-        a.state = v + 1; // writes its own dependency
+        a.set(v + 1); // writes its own dependency
         return v;
       },
     });
@@ -269,7 +269,7 @@ describe('writes inside computeds', () => {
       const other = new Atom({ state: 0 });
       const c = new Computed({
         fn: () => {
-          other.state = 1;
+          other.set(1);
           return 1;
         },
       });
@@ -410,7 +410,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     expect(c.state).toBe(10);
 
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     expect(isForked()).toBe(true);
 
@@ -454,7 +454,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     expect(seen).toEqual([1]);
 
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     expect(seen).toEqual([1]); // pending transition: effect not yet re-run
 
@@ -469,10 +469,10 @@ describe('worlds (transition writes, folds, render passes)', () => {
     expect(sum.state).toBe(0);
 
     withLane(LANE_T, true, () => {
-      a.state = 1;
+      a.set(1);
     });
     withLane(LANE_SYNC, false, () => {
-      b.state = 1;
+      b.set(1);
     });
 
     // Urgent render: sees b=1, not a=1.
@@ -510,10 +510,10 @@ describe('worlds (transition writes, folds, render passes)', () => {
     expect(changes).toEqual([5]);
 
     withLane(LANE_T, true, () => {
-      a.state = 2; // head world: c no longer depends on b
+      a.set(2); // head world: c no longer depends on b
     });
     withLane(LANE_SYNC, false, () => {
-      b.state = 6; // committed world: c must update to 6
+      b.set(6); // committed world: c must update to 6
     });
     fold((entry) => entry.lane === LANE_SYNC);
     // Committed world: a=1, b=6 → c=6.
@@ -528,12 +528,12 @@ describe('worlds (transition writes, folds, render passes)', () => {
     const a = new Atom({ state: 1 });
     setWriteLaneProvider(() => ({ lane: LANE_SYNC, transition: false }));
     try {
-      a.state = 2;
+      a.set(2);
       const pin = currentWriteSeq();
       pinRenderPass(pin);
       const world = makeWorld(LANE_SYNC, pin);
 
-      a.state = 3; // lands after the pass pinned
+      a.set(3); // lands after the pass pinned
       const prev = setAmbientWorld(world);
       try {
         expect(a.state).toBe(2); // pass still sees its own snapshot

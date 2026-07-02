@@ -77,10 +77,10 @@ describe('review: fold ordering', () => {
   test('A: transition fold must not clobber a later urgent write (fold sync, then fold transition)', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2; // transition write, seq 1
+      a.set(2); // transition write, seq 1
     });
     withLane(LANE_SYNC, false, () => {
-      a.state = 3; // urgent write, seq 2 — write-through to BASE
+      a.set(3); // urgent write, seq 2 — write-through to BASE
     });
     expect(a.state).toBe(3); // head: last write wins
 
@@ -96,10 +96,10 @@ describe('review: fold ordering', () => {
   test('A2: folding an older transition lane after a newer one rolls the value back', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2; // lane T, seq 1
+      a.set(2); // lane T, seq 1
     });
     withLane(LANE_T2, true, () => {
-      a.state = 3; // lane T2, seq 2
+      a.set(3); // lane T2, seq 2
     });
     fold((e) => e.lane === LANE_T2);
     expect(a.state).toBe(3); // ok so far (untracked read; still forked with T pending)
@@ -122,10 +122,10 @@ describe('review: head plane seeding', () => {
     const c = new Computed({ fn: () => a.state * 10 });
     expect(c.state).toBe(10); // evaluate once; mirrors synced
 
-    a.state = 2; // steady-state write; c stays lazily stale (Pending)
+    a.set(2); // steady-state write; c stays lazily stale (Pending)
 
     withLane(LANE_T, true, () => {
-      z.state = 1; // unrelated transition write → fork
+      z.set(1); // unrelated transition write → fork
     });
 
     expect(a.state).toBe(2); // head atom read: fine
@@ -147,10 +147,10 @@ describe('review: render-world fast paths', () => {
     const cb = new Computed({ fn: () => b.state });
     expect(cb.state).toBe(10); // participate: evaluated once, deps exist
     withLane(LANE_T, true, () => {
-      a.state = 2; // fork; makes the world "see transitions"
+      a.set(2); // fork; makes the world "see transitions"
     });
     withLane(LANE_SYNC, false, () => {
-      b.state = 11; // urgent write, unfolded, lane NOT in the world below
+      b.set(11); // urgent write, unfolded, lane NOT in the world below
     });
     const world = makeWorld(LANE_T, currentWriteSeq());
     const prev = setAmbientWorld(world);
@@ -173,7 +173,7 @@ describe('review: render-world fast paths', () => {
     const cb = new Computed({ fn: () => b.state });
     expect(cb.state).toBe(10); // participate: evaluated once, deps exist
     withLane(LANE_SYNC, false, () => {
-      b.state = 11; // logged urgent entry, unfolded
+      b.set(11); // logged urgent entry, unfolded
     });
     const world = makeWorld(LANE_T, currentWriteSeq()); // lanes exclude LANE_SYNC
     const prev = setAmbientWorld(world);
@@ -196,7 +196,7 @@ describe('review: pinned render passes vs fold', () => {
   test('E: a fold while a pass is pinned must not change the pass’s reads', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     const pin = currentWriteSeq();
     pinRenderPass(pin);
@@ -243,7 +243,7 @@ describe('review: subscription notifications', () => {
       notifies++;
     });
     subscribeTo(w, c.node);
-    a.state = 2;
+    a.set(2);
     expect(notifies).toBe(1); // actual: 2
   });
 
@@ -266,7 +266,7 @@ describe('review: subscription notifications', () => {
     await promise; // settle: muted propagate marks w Pending, no notify (by design)
     expect(notifies).toBe(0);
 
-    a.state = 2; // genuine change: c's committed result suspended→12
+    a.set(2); // genuine change: c's committed result suspended→12
     expect(notifies).toBeGreaterThan(0); // actual: 0 — pruned as alreadyMarked
   });
 
@@ -287,13 +287,13 @@ describe('review: subscription notifications', () => {
     subscribeTo(w, c.node);
 
     withLane(LANE_T, true, () => {
-      t.state = 1; // fork; head c: 0→1 → notify fires
+      t.set(1); // fork; head c: 0→1 → notify fires
     });
     const before = notifies;
     expect(before).toBeGreaterThan(0);
 
     withLane(LANE_SYNC, false, () => {
-      a.state = 1; // BASE c: 0→1 (urgent world changed!); HEAD c: 1→1 (cutoff)
+      a.set(1); // BASE c: 0→1 (urgent world changed!); HEAD c: 1→1 (cutoff)
     });
     expect(notifies).toBeGreaterThan(before); // actual: unchanged — swallowed
   });
@@ -303,10 +303,10 @@ describe('review: sanity checks that pass (kept as regression guards)', () => {
   test('fold of both lanes in one call keeps last-write-wins', () => {
     const a = new Atom({ state: 1 });
     withLane(LANE_T, true, () => {
-      a.state = 2;
+      a.set(2);
     });
     withLane(LANE_SYNC, false, () => {
-      a.state = 3;
+      a.set(3);
     });
     fold(() => true); // single fold call folds in log order
     expect(a.state).toBe(3);
@@ -323,8 +323,8 @@ describe('review: sanity checks that pass (kept as regression guards)', () => {
     });
     expect(runs).toBe(1);
     withLane(LANE_T, true, () => {
-      a.state = 2;
-      b.state = 2;
+      a.set(2);
+      b.set(2);
     });
     expect(runs).toBe(1); // pending transition: not yet
     fold((e) => e.lane === LANE_T);

@@ -10,9 +10,10 @@ import { Atom, Computed, useSignal, useComputed, useSignalEffect } from 'react-s
 
 const count = new Atom({
   state: 0,
+  label: 'count',
   // Runs when the atom becomes observed; cleanup when it no longer is.
   effect: (ctx) => {
-    const ws = subscribeRemote((v) => (ctx.state = v));
+    const ws = subscribeRemote((v) => ctx.set(v));
     return () => ws.close();
   },
 });
@@ -43,15 +44,37 @@ function MyComponent(props: { other: number }) {
 }
 ```
 
-Writes are plain assignments — `count.state = 1` — and compose with React
-exactly like `setState`:
+Writes go through `set` and `update`, and compose with React exactly like
+`setState` — including functional-update rebasing:
 
 ```tsx
+count.set(5);                  // replace
+count.update((x) => x + 1);    // functional update: stored and REPLAYED per
+                               // world, like a queued setState(fn) — an urgent
+                               // update interleaving a pending transition
+                               // applies to committed state now and re-applies
+                               // on top of the transition when it commits.
+
 startTransition(() => {
-  count.state = 5;        // rides the transition
+  count.set(5);           // rides the transition
   setTab('details');      // same lane — both commit in the same frame
 });
+
+// Or, equivalently, with write coalescing (one notification per subscriber):
+startSignalTransition(() => {
+  count.set(5);
+  setTab('details');
+});
 ```
+
+Reducer-shaped state gets the same treatment: `new ReducerAtom({ state, reduce })`
+with `atom.dispatch(action)` matches `useReducer` semantics action-for-action
+(dispatches rebase across transitions identically — there's a side-by-side
+equivalence test). Component-lifetime signals come from `useAtom(initial)` and
+`useReducerAtom(reduce, initial)`; read them with `useSignal` wherever they're
+passed. In development, reading `atom.state` raw in a render body throws (it
+wouldn't be reactive); `configure({ throwOnUntrackedReadsInRender: false })`
+opts out.
 
 The committed DOM keeps showing the old signal values until the transition
 commits; urgent updates that interleave render against committed state and

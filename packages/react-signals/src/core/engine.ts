@@ -159,7 +159,17 @@ export type Node = {
 };
 
 export type WriteEntry = {
+  /** For a plain set: the written value. Unused when `apply` is present. */
   value: unknown;
+  /**
+   * For a functional update (atom.update / ReducerAtom.dispatch): computes
+   * the next value from the previous one. Stored — not eagerly evaluated —
+   * so each world replays it against ITS previous value, exactly like
+   * React replays queued useState/useReducer updaters when rebasing.
+   * Must be pure: it can run once per world that includes it (plus once at
+   * dispatch for the head value), in any order relative to other worlds.
+   */
+  apply: ((prev: unknown) => unknown) | null;
   /** Opaque React lane the write's broadcasts were scheduled at. */
   lane: number;
   /** Global write sequence number. */
@@ -171,15 +181,12 @@ export type WriteEntry = {
 };
 
 export type AtomNode = Node & {
-  /** Debug label (Atom `name` option); used by tracing and visualizers. */
-  name: string | null;
+  /** Debug label (Atom `label` option); used by tracing and visualizers. */
+  label: string | null;
   /** BASE-plane value as of the last pull (alien-signals `currentValue`). */
   value: unknown;
   /** BASE-plane latest write, committed to `value` lazily on pull. */
   buffered: unknown;
-  /** seq of the write currently reflected in `buffered`. Folds must never
-   * roll BASE back past this. */
-  baseSeq: number;
   /** HEAD-plane value (kept in sync with the latest write, eagerly). */
   headValue: unknown;
   /** Value before the oldest retained log entry (for pinned render passes). */
@@ -195,8 +202,8 @@ export const STATUS_ERROR = 1;
 export const STATUS_SUSPENDED = 2;
 
 export type ComputedNode = Node & {
-  /** Debug label (Computed `name` option); used by tracing and visualizers. */
-  name: string | null;
+  /** Debug label (Computed `label` option); used by tracing and visualizers. */
+  label: string | null;
   value: unknown;
   /** STATUS_* for the BASE-plane result. */
   status: number;
@@ -282,8 +289,44 @@ let mutedSubscriptions = false;
 
 export type EngineConfig = {
   forbidWritesInComputeds: boolean;
+  /**
+   * Throw when a signal is read raw (not through useSignal/useComputed/a
+   * tracked context) while React is rendering. Such reads are not reactive —
+   * the component won't re-render when the signal changes — and they bypass
+   * the render pass's world, so they're almost always bugs. The React
+   * bindings enable this automatically in development builds.
+   */
+  throwOnUntrackedReadsInRender: boolean;
 };
-export const config: EngineConfig = { forbidWritesInComputeds: false };
+export const config: EngineConfig = {
+  forbidWritesInComputeds: false,
+  throwOnUntrackedReadsInRender: false,
+};
+
+/**
+ * Installed by the React bindings: returns true while React is rendering on
+ * this thread. Only consulted on the raw-read path when
+ * throwOnUntrackedReadsInRender is enabled.
+ */
+let renderGuard: (() => boolean) | null = null;
+export function setRenderGuard(guard: (() => boolean) | null): void {
+  renderGuard = guard;
+}
+
+function checkUntrackedRenderRead(node: Node): void {
+  if (config.throwOnUntrackedReadsInRender && renderGuard !== null && renderGuard()) {
+    const label =
+      node.kind === KIND_ATOM || node.kind === KIND_COMPUTED
+        ? ((node as AtomNode | ComputedNode).label ?? '(unlabeled)')
+        : '(watcher)';
+    throw new Error(
+      `Untracked read of signal ${label} during render. Reads in render bodies ` +
+        'must go through useSignal/useComputed so the component re-renders when ' +
+        'the signal changes (and reads the correct world during transitions). ' +
+        'To allow raw render reads, configure({ throwOnUntrackedReadsInRender: false }).',
+    );
+  }
+}
 
 export type WriteLaneProvider = () => { lane: number; transition: boolean } | null;
 let writeLaneProvider: WriteLaneProvider | null = null;
@@ -674,14 +717,20 @@ function queueWatcher(w: WatcherNode, planeMask: number): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Confirms and fires queued subscriptions, then flushes queued effects
- * (unless batched or mid-evaluation). Called after every propagation wave —
- * write sites, fold, settle, batch end, and after reads whose lazy pulls
- * promoted watchers.
+ * Confirms and fires queued subscriptions, then flushes queued effects.
+ * Called after every propagation wave — write sites, fold, settle, batch end,
+ * and after reads whose lazy pulls promoted watchers.
+ *
+ * Both deliveries wait for `batch()` to end: the queue's dedupe (the Watching
+ * bit) means N writes inside one batch produce at most one confirmation and
+ * one onChange per subscription. Delivery still happens synchronously inside
+ * whatever context called endBatch — for `startSignalTransition`, inside the
+ * transition scope, which is what React lane attribution needs.
  */
 function deliverNotifications(): void {
+  if (batchDepth !== 0) return;
   if (subQueueIndex < subQueueLength) drainSubscriptions();
-  if (batchDepth === 0 && evalDepth === 0 && effectQueueIndex < effectQueueLength) {
+  if (evalDepth === 0 && effectQueueIndex < effectQueueLength) {
     flushEffects();
   }
 }
@@ -1110,6 +1159,7 @@ export function readAtom(atom: AtomNode): unknown {
   const world = ambientWorld;
   if (world !== null) return resolveAtomInWorld(atom, world);
   // Untracked read outside render: latest-write ("head") semantics.
+  checkUntrackedRenderRead(atom);
   const value = forkCount > 0 ? atom.headValue : baseAtomValue(atom);
   deliverNotifications(); // a lazy commit may have promoted watchers
   return value;
@@ -1125,14 +1175,22 @@ function baseAtomValue(atom: AtomNode): unknown {
 function resolveAtomInWorld(atom: AtomNode, world: RenderWorld): unknown {
   const log = atom.log;
   if (log === null || log.length === 0) return baseAtomValue(atom);
-  for (let i = log.length - 1; i >= 0; i--) {
+  // Replay visible entries in write order (matching React's queue replay):
+  // plain sets overwrite; functional updates apply to the value accumulated
+  // so far IN THIS WORLD — that's what makes an updater rebase correctly.
+  let value = atom.preLogValue;
+  for (let i = 0; i < log.length; i++) {
     const e = log[i]!;
     // An entry is visible if it folded before the pass pinned (fold-time
     // stamp!) or if the pass's lanes carry it and it existed at pin time.
-    if (e.foldedAtSeq !== 0 && e.foldedAtSeq <= world.maxSeq) return e.value;
-    if (e.seq <= world.maxSeq && world.laneIncluded(world.lanes, e.lane)) return e.value;
+    const visible =
+      (e.foldedAtSeq !== 0 && e.foldedAtSeq <= world.maxSeq) ||
+      (e.seq <= world.maxSeq && world.laneIncluded(world.lanes, e.lane));
+    if (visible) {
+      value = e.apply !== null ? e.apply(value) : e.value;
+    }
   }
-  return atom.preLogValue;
+  return value;
 }
 
 /**
@@ -1151,6 +1209,7 @@ export function readComputed(c: ComputedNode): unknown {
   }
   // Inside a tracked evaluation, stay in that evaluation's plane; untracked
   // non-render reads get latest-write ("head") semantics, matching atoms.
+  if (sub === undefined) checkUntrackedRenderRead(c);
   const plane: Plane =
     forkCount === 0 ? PLANE_BASE : sub !== undefined ? activePlane : PLANE_HEAD;
   pullComputed(c, plane);
@@ -1295,12 +1354,17 @@ function unwrapCached(cached: [object, unknown, number, unknown]): unknown {
  */
 export function peekNodeValue(node: Node, plane: Plane): unknown {
   const requested: Plane = forkCount > 0 ? plane : PLANE_BASE;
-  if (node.kind === KIND_ATOM) {
-    return requested === PLANE_HEAD
-      ? (node as AtomNode).headValue
-      : baseAtomValue(node as AtomNode);
+  try {
+    if (node.kind === KIND_ATOM) {
+      return requested === PLANE_HEAD
+        ? (node as AtomNode).headValue
+        : baseAtomValue(node as AtomNode);
+    }
+    return readInPlane(node as ComputedNode, requested);
+  } finally {
+    // Lazy pulls above may have promoted watchers; don't leave them queued.
+    deliverNotifications();
   }
-  return readInPlane(node as ComputedNode, requested);
 }
 
 function worldSeesTransitionWrites(world: RenderWorld): boolean {
@@ -1346,7 +1410,28 @@ function unfoldedEntriesAllIncluded(world: RenderWorld, includeTransitions: bool
 // Writes
 // ---------------------------------------------------------------------------
 
+/** Replaces the atom's value. */
 export function writeAtom(atom: AtomNode, value: unknown): void {
+  writeAtomImpl(atom, value, null);
+}
+
+/**
+ * Functional update (atom.update / ReducerAtom.dispatch): `apply` is stored
+ * in the write log and REPLAYED per world, giving React useState/useReducer
+ * rebasing semantics. An urgent `x => x * 2` interleaving a pending
+ * transition's `x => x + 1` doubles the committed value for the urgent
+ * render, and doubles the incremented value when the transition commits —
+ * the updater runs once per world that includes it. It must be pure.
+ */
+export function applyAtom(atom: AtomNode, apply: (prev: unknown) => unknown): void {
+  writeAtomImpl(atom, undefined, apply);
+}
+
+function writeAtomImpl(
+  atom: AtomNode,
+  value: unknown,
+  apply: ((prev: unknown) => unknown) | null,
+): void {
   if (
     config.forbidWritesInComputeds &&
     activeSub !== undefined &&
@@ -1369,32 +1454,51 @@ export function writeAtom(atom: AtomNode, value: unknown): void {
         : undefined;
 
     if (laneInfo !== null && laneInfo.transition) {
-      writeTransitionEntry(atom, value, laneInfo.lane, cycleGuard);
+      // Transition write: log it (for world reads and the eventual fold) and
+      // advance HEAD only. Updaters evaluate here against the head value —
+      // their position in head history — and are replayed for other worlds.
+      const seq = appendLog(atom, value, apply, laneInfo.lane, true);
+      if (forkCount === 0) ++forkGen;
+      ++forkCount;
+      const headNext = apply !== null ? apply(atom.headValue) : value;
+      if (!atom.isEqual(atom.headValue, headNext)) {
+        atom.headValue = headNext;
+        atom.flags |= F.HeadDirty;
+        headChangeSeq = seq;
+        if (atom.subs !== undefined) {
+          propagate(atom.subs, PLANE_HEAD, cycleGuard);
+        }
+      }
+      deliverNotifications();
       return;
     }
+
     let entrySeq = 0;
-    if (laneInfo !== null) entrySeq = appendLog(atom, value, laneInfo.lane, false);
+    if (laneInfo !== null) entrySeq = appendLog(atom, value, apply, laneInfo.lane, false);
 
     // Urgent/plain write: write-through on BASE (and HEAD, since urgent
-    // writes are chronologically part of the head world too).
+    // writes are chronologically part of the head world too). For updaters
+    // the two planes evaluate independently against their own previous
+    // values — that IS the rebase.
     let mask = 0;
-    if (!atom.isEqual(atom.buffered, value)) {
-      atom.buffered = value;
+    const baseNext = apply !== null ? apply(atom.buffered) : value;
+    if (!atom.isEqual(atom.buffered, baseNext)) {
+      atom.buffered = baseNext;
       atom.flags |= F.Dirty;
       mask |= PLANE_BASE;
       baseChangeSeq = entrySeq !== 0 ? entrySeq : ++writeSeq;
       headChangeSeq = baseChangeSeq;
     }
-    atom.baseSeq = entrySeq !== 0 ? entrySeq : writeSeq;
     if (forkCount > 0) {
-      if (!atom.isEqual(atom.headValue, value)) {
-        atom.headValue = value;
+      const headNext = apply !== null ? apply(atom.headValue) : value;
+      if (!atom.isEqual(atom.headValue, headNext)) {
+        atom.headValue = headNext;
         atom.flags |= F.HeadDirty;
         mask |= PLANE_HEAD;
-        headChangeSeq = atom.baseSeq;
+        headChangeSeq = entrySeq !== 0 ? entrySeq : writeSeq;
       }
     } else {
-      atom.headValue = value;
+      atom.headValue = atom.buffered;
     }
     if (mask !== 0 && atom.subs !== undefined) {
       propagate(atom.subs, forkCount > 0 ? mask : PLANE_BOTH, cycleGuard);
@@ -1405,34 +1509,20 @@ export function writeAtom(atom: AtomNode, value: unknown): void {
   }
 }
 
-function writeTransitionEntry(
+function appendLog(
   atom: AtomNode,
   value: unknown,
+  apply: ((prev: unknown) => unknown) | null,
   lane: number,
-  cycleGuard: Node | undefined,
-): void {
-  const seq = appendLog(atom, value, lane, true);
-  if (forkCount === 0) ++forkGen;
-  ++forkCount;
-  if (!atom.isEqual(atom.headValue, value)) {
-    atom.headValue = value;
-    atom.flags |= F.HeadDirty;
-    headChangeSeq = seq;
-    if (atom.subs !== undefined) {
-      propagate(atom.subs, PLANE_HEAD, cycleGuard);
-    }
-  }
-  deliverNotifications();
-}
-
-function appendLog(atom: AtomNode, value: unknown, lane: number, transition: boolean): number {
+  transition: boolean,
+): number {
   if (atom.log === null || atom.log.length === 0) {
     atom.preLogValue = baseAtomValue(atom);
     if (atom.log === null) atom.log = [];
     loggedAtoms.add(atom);
   }
   const seq = ++writeSeq;
-  atom.log.push({ value, lane, seq, foldedAtSeq: 0, transition });
+  atom.log.push({ value, apply, lane, seq, foldedAtSeq: 0, transition });
   return seq;
 }
 
@@ -1449,14 +1539,15 @@ export type FoldDecision = (entry: WriteEntry) => boolean;
  *
  * BASE is last-write-wins in *write* order: a fold never rolls the base value
  * back past a newer write that is already part of BASE (write-through urgent
- * writes, or entries folded earlier) — `atom.baseSeq` guards this.
+ * writes, or entries folded earlier): BASE is recomputed by replaying the
+ * log in write order, so updaters rebase and no fold can roll BASE backward.
  *
  * Fold-propagation runs on BASE and re-runs effect watchers (their committed
  * world changed); subscriptions are not marked — components were notified in
  * the writer's context and have either rendered these values or have the
  * update queued.
  */
-export function fold(shouldFold: FoldDecision): void {
+export function fold(shouldFold: FoldDecision, deferEffectFlush = false): void {
   if (loggedAtoms.size === 0) return;
   const cause = tracer !== null ? setCurrentCause(tracer.emit('fold', currentCause)) : 0;
   const prevMuted = mutedSubscriptions;
@@ -1466,19 +1557,31 @@ export function fold(shouldFold: FoldDecision): void {
     for (const atom of loggedAtoms) {
       const log = atom.log;
       if (log === null) continue;
-      let newest: WriteEntry | null = null;
+      let anyNewlyFolded = false;
       for (let i = 0; i < log.length; i++) {
         const e = log[i]!;
         if (e.foldedAtSeq === 0 && shouldFold(e)) {
           e.foldedAtSeq = ++writeSeq;
           if (e.transition) --forkCount;
-          if (newest === null || e.seq > newest.seq) newest = e;
+          anyNewlyFolded = true;
         }
       }
-      if (newest !== null && newest.seq > atom.baseSeq) {
-        atom.baseSeq = newest.seq;
-        if (!atom.isEqual(atom.buffered, newest.value)) {
-          atom.buffered = newest.value;
+      if (anyNewlyFolded) {
+        // Recompute BASE by replaying, in write order, every entry that
+        // participates in it: folded entries plus still-pending urgent
+        // (write-through) entries. Replay — rather than taking the newest
+        // folded value — is what rebases pending urgent updaters on top of a
+        // just-committed transition, and what keeps an older transition's
+        // fold from rolling BASE back past a newer urgent write.
+        let next = atom.preLogValue;
+        for (let i = 0; i < log.length; i++) {
+          const e = log[i]!;
+          if (e.foldedAtSeq !== 0 || !e.transition) {
+            next = e.apply !== null ? e.apply(next) : e.value;
+          }
+        }
+        if (!atom.isEqual(atom.buffered, next)) {
+          atom.buffered = next;
           atom.flags |= F.Dirty;
           baseChangeSeq = ++writeSeq;
           headChangeSeq = writeSeq;
@@ -1492,7 +1595,12 @@ export function fold(shouldFold: FoldDecision): void {
     mutedSubscriptions = prevMuted;
     if (tracer !== null) setCurrentCause(cause);
   }
-  deliverNotifications();
+  // A React commit calls fold from inside the commit phase; the caller defers
+  // the effect flush to a microtask so user effect code never runs mid-commit.
+  // Deferring must NOT hold the global batch open: post-commit synchronous
+  // writes (layout effects, event handlers) need their broadcasts delivered
+  // in their own context for lane attribution and loop protection.
+  if (!deferEffectFlush) deliverNotifications();
 }
 
 /**
@@ -1513,7 +1621,9 @@ function sweepLogs(): void {
     while (keepFrom < log.length) {
       const e = log[keepFrom]!;
       if (e.foldedAtSeq !== 0 && e.foldedAtSeq <= bound) {
-        atom.preLogValue = e.value;
+        // Collapse the entry into the pre-log value, replaying updaters so
+        // the collapsed prefix equals what any world would have computed.
+        atom.preLogValue = e.apply !== null ? e.apply(atom.preLogValue) : e.value;
         keepFrom++;
       } else {
         break;
@@ -1545,7 +1655,7 @@ export function startBatch(): void {
 }
 
 export function endBatch(): void {
-  if (--batchDepth === 0 && evalDepth === 0) deliverNotifications();
+  if (--batchDepth === 0) deliverNotifications();
 }
 
 export function flushEffects(): void {
@@ -1691,7 +1801,7 @@ export function createAtomNode(
   initial: unknown,
   isEqual: ((a: unknown, b: unknown) => boolean) | undefined,
   lifecycle: unknown,
-  name?: string,
+  label?: string,
 ): AtomNode {
   return {
     kind: KIND_ATOM,
@@ -1701,10 +1811,9 @@ export function createAtomNode(
     depsTail: undefined,
     subs: undefined,
     subsTail: undefined,
-    name: name ?? null,
+    label: label ?? null,
     value: initial,
     buffered: initial,
-    baseSeq: 0,
     headValue: initial,
     preLogValue: initial,
     log: null,
@@ -1716,7 +1825,7 @@ export function createAtomNode(
 export function createComputedNode(
   fn: (ctx: unknown) => unknown,
   isEqual: ((a: unknown, b: unknown) => boolean) | undefined,
-  name?: string,
+  label?: string,
 ): ComputedNode {
   return {
     kind: KIND_COMPUTED,
@@ -1726,7 +1835,7 @@ export function createComputedNode(
     depsTail: undefined,
     subs: undefined,
     subsTail: undefined,
-    name: name ?? null,
+    label: label ?? null,
     value: undefined,
     status: STATUS_VALUE,
     payload: undefined,

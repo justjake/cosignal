@@ -8,6 +8,7 @@
  */
 
 import {
+  applyAtom,
   type AtomNode,
   type ComputedNode,
   type WatcherNode,
@@ -36,7 +37,8 @@ export { flushEffects } from './engine.ts';
 /** Passed to an Atom's `effect` option when the atom becomes observed. */
 export type AtomCtx<T> = {
   get state(): T;
-  set state(value: T);
+  set(value: T): void;
+  update(fn: (current: T) => T): void;
 };
 
 export type AtomOptions<T> = {
@@ -51,7 +53,7 @@ export type AtomOptions<T> = {
   /** Defaults to Object.is. */
   isEqual?: (a: T, b: T) => boolean;
   /** Debug label shown by tracing and the graphviz visualizers. */
-  name?: string;
+  label?: string;
 };
 
 export type ComputedCtx<T> = {
@@ -70,7 +72,7 @@ export type ComputedOptions<T> = {
   /** Defaults to Object.is. */
   isEqual?: (a: T, b: T) => boolean;
   /** Debug label shown by tracing and the graphviz visualizers. */
-  name?: string;
+  label?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,15 +149,18 @@ export class Atom<T> {
       options.state,
       options.isEqual as ((a: unknown, b: unknown) => boolean) | undefined,
       options.effect !== undefined ? options : null,
-      options.name,
+      options.label,
     );
     const self = this;
     this.lifecycleCtx = {
       get state(): T {
         return untracked(() => readAtom(self.node)) as T;
       },
-      set state(value: T) {
+      set(value: T): void {
         writeAtom(self.node, value);
+      },
+      update(fn: (current: T) => T): void {
+        applyAtom(self.node, fn as (prev: unknown) => unknown);
       },
     };
     if (options.effect !== undefined) {
@@ -169,12 +174,25 @@ export class Atom<T> {
     }
   }
 
+  /** The atom's current value (reactive when read inside a tracked context). */
   get state(): T {
     return readAtom(this.node) as T;
   }
 
-  set state(value: T) {
+  /** Replaces the atom's value. */
+  set(value: T): void {
     writeAtom(this.node, value);
+  }
+
+  /**
+   * Functional update with React setState semantics: `fn` is stored in the
+   * write log and replayed per world, so it rebases exactly like a queued
+   * `setState(fn)` — an urgent update interleaving a pending transition
+   * applies to committed state now and re-applies on top of the transition
+   * when it commits. `fn` must be pure; it may run more than once.
+   */
+  update(fn: (current: T) => T): void {
+    applyAtom(this.node, fn as (prev: unknown) => unknown);
   }
 }
 
@@ -190,7 +208,7 @@ export class Computed<T> {
     this.node = createComputedNode(
       options.fn as (ctx: unknown) => unknown,
       options.isEqual as ((a: unknown, b: unknown) => boolean) | undefined,
-      options.name,
+      options.label,
     );
   }
 
@@ -200,6 +218,46 @@ export class Computed<T> {
    */
   get state(): T {
     return readComputed(this.node) as T;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ReducerAtom
+// ---------------------------------------------------------------------------
+
+export type ReducerAtomOptions<S, A> = {
+  state: S;
+  /** Pure: computes the next state from the current state and an action. */
+  reduce: (state: S, action: A) => S;
+  /** Defaults to Object.is. */
+  isEqual?: (a: S, b: S) => boolean;
+  /** Debug label shown by tracing and the graphviz visualizers. */
+  label?: string;
+};
+
+/**
+ * An atom whose writes go through a reducer, with React useReducer
+ * semantics: each dispatched action is stored in the write log and the
+ * reducer is REPLAYED per world, so actions rebase exactly like queued
+ * useReducer actions — an urgent dispatch interleaving a pending
+ * transition's dispatch reduces committed state now, and re-reduces on top
+ * of the transition's result when it commits. The reducer must be pure; it
+ * can run once per world that includes an action.
+ */
+export class ReducerAtom<S, A> extends Atom<S> {
+  readonly reduce: (state: S, action: A) => S;
+
+  constructor(options: ReducerAtomOptions<S, A>) {
+    const init: AtomOptions<S> = { state: options.state };
+    if (options.isEqual !== undefined) init.isEqual = options.isEqual;
+    if (options.label !== undefined) init.label = options.label;
+    super(init);
+    this.reduce = options.reduce;
+  }
+
+  dispatch(action: A): void {
+    const reduce = this.reduce;
+    applyAtom(this.node, (prev) => reduce(prev as S, action));
   }
 }
 
@@ -256,10 +314,31 @@ export type ConfigureOptions = {
    * a dependency cycle back into the writing computed (CycleError).
    */
   forbidWritesInComputeds?: boolean;
+  /**
+   * When true, reading a signal raw (`atom.state` in a render body, not
+   * through useSignal/useComputed) while React is rendering throws. Such
+   * reads are not reactive and bypass the render's world. The React bindings
+   * turn this on automatically in development builds; set it explicitly to
+   * override either way.
+   */
+  throwOnUntrackedReadsInRender?: boolean;
 };
+
+const explicitlyConfigured = new Set<keyof ConfigureOptions>();
 
 export function configure(options: ConfigureOptions): void {
   if (options.forbidWritesInComputeds !== undefined) {
     config.forbidWritesInComputeds = options.forbidWritesInComputeds;
+    explicitlyConfigured.add('forbidWritesInComputeds');
   }
+  if (options.throwOnUntrackedReadsInRender !== undefined) {
+    config.throwOnUntrackedReadsInRender = options.throwOnUntrackedReadsInRender;
+    explicitlyConfigured.add('throwOnUntrackedReadsInRender');
+  }
+}
+
+/** Internal: lets the React bindings apply dev-mode defaults without
+ * overriding anything the app configured explicitly. */
+export function wasExplicitlyConfigured(key: keyof ConfigureOptions): boolean {
+  return explicitlyConfigured.has(key);
 }

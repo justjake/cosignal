@@ -57,7 +57,7 @@ describe('finding 1: mid-propagate effect flush loses sibling updates', () => {
     const seen2: number[] = [];
     const d1 = effect(() => void seen1.push(a.state));
     const d2 = effect(() => void seen2.push(a.state));
-    a.state = 2;
+    a.set(2);
     d1();
     d2();
     expect(seen1).toEqual([1, 2]);
@@ -79,7 +79,7 @@ describe('finding 1: mid-propagate effect flush loses sibling updates', () => {
     // validates join "clean". When propagate then marks id and re-queues the
     // effect, id's pull finds the atom already clean → everything is
     // "validated clean" while id/join still hold pre-write values.
-    a.state = 1;
+    a.set(1);
     const joinNow = join.state;
     dispose();
     expect(seen).toEqual([99, 101]); // FAILS: [99] — effect never re-ran
@@ -141,12 +141,12 @@ describe('finding 3: stale HeadPending prunes HEAD propagation after fork', () =
     const c = new Computed({ fn: () => a.state * 10 });
     expect(c.state).toBe(10); // evaluate + link c→a
 
-    a.state = 2; // steady write: marks c Pending|HeadPending
+    a.set(2); // steady write: marks c Pending|HeadPending
     const d = new Computed({ fn: () => c.state + 1 });
     expect(d.state).toBe(21); // BASE pull clears c's Pending; HeadPending survives
 
     withLane(LANE_T, true, () => {
-      a.state = 3; // HEAD propagate prunes at c → d never marked HeadPending
+      a.set(3); // HEAD propagate prunes at c → d never marked HeadPending
     });
     expect(isForked()).toBe(true);
     expect(c.state).toBe(30); // c itself self-heals via its own stale bit
@@ -157,7 +157,7 @@ describe('finding 3: stale HeadPending prunes HEAD propagation after fork', () =
     const a = new Atom({ state: 1 });
     const c = new Computed({ fn: () => a.state * 10 });
     expect(c.state).toBe(10);
-    a.state = 2; // pollute c with stale HeadPending
+    a.set(2); // pollute c with stale HeadPending
     expect(c.state).toBe(20); // BASE pull; HeadPending remains
 
     let notifies = 0;
@@ -165,7 +165,7 @@ describe('finding 3: stale HeadPending prunes HEAD propagation after fork', () =
     subscribeTo(s, c.node);
     try {
       withLane(LANE_T, true, () => {
-        a.state = 3; // genuine head change 20→30; propagate prunes at c
+        a.set(3); // genuine head change 20→30; propagate prunes at c
       });
       expect(notifies).toBeGreaterThan(0); // FAILS: 0 — component never re-renders
     } finally {
@@ -192,7 +192,7 @@ describe('finding 4: effect disposed during its own dirtiness check is resurrect
     const c = new Computed({
       fn: () => {
         const v = a.state * 10;
-        x.state = v; // legal write-inside-computed (side channel)
+        x.set(v); // legal write-inside-computed (side channel)
         return v;
       },
     });
@@ -209,11 +209,15 @@ describe('finding 4: effect disposed during its own dirtiness check is resurrect
     });
     subscribeTo(s, x.node);
     try {
-      a.state = 2; // e's checkDirty → updateComputed(c) → write x → s.onChange
-      // disposes e mid-check; checkDirty returns true anyway → e re-runs.
-      expect(runs).toEqual([10]); // FAILS: [10, 20] — ran after disposal
-      a.state = 3;
-      expect(runs).toEqual([10]); // FAILS: [10, 20, 30] — permanently resurrected
+      // Since batch-deferred delivery, s.onChange no longer fires mid-pull:
+      // the write to x inside c's evaluation queues s, the effect's re-run
+      // completes (runs gains 20), and only then does s fire and dispose e.
+      // The guarded property is anti-resurrection: once disposed, e must
+      // never run again — with the original bug, runs kept growing forever.
+      a.set(2);
+      expect(runs).toEqual([10, 20]); // ran once, then unmount-on-change fired
+      a.set(3);
+      expect(runs).toEqual([10, 20]); // disposed stays disposed
     } finally {
       disposeWatcher(s);
       disposeE();

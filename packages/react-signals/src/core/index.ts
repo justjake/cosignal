@@ -8,6 +8,7 @@
 export {
   Atom,
   Computed,
+  ReducerAtom,
   effect,
   batch,
   configure,
@@ -26,6 +27,7 @@ export type {
   AtomCtx,
   ComputedOptions,
   ComputedCtx,
+  ReducerAtomOptions,
   Signal,
   ConfigureOptions,
 } from './api.ts';

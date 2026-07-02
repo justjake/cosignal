@@ -18,7 +18,7 @@ describe('tracing', () => {
     });
 
     session.clear();
-    a.state = 2;
+    a.set(2);
 
     const events = session.events();
     const types = events.map((e) => e.type);
@@ -41,13 +41,13 @@ describe('tracing', () => {
   test('zero-overhead when disabled: no events recorded after disable', () => {
     session = enableTracing();
     const a = new Atom({ state: 1 });
-    a.state = 2;
+    a.set(2);
     expect(session.events().length).toBeGreaterThan(0);
     const s = session;
     s.disable();
     session = null;
     const before = s.events().length;
-    a.state = 3;
+    a.set(3);
     expect(s.events().length).toBe(before);
   });
 
@@ -58,7 +58,7 @@ describe('tracing', () => {
       seen.push(e.type);
     });
     const a = new Atom({ state: 0 });
-    for (let i = 1; i <= 10; i++) a.state = i;
+    for (let i = 1; i <= 10; i++) a.set(i);
     expect(seen.length).toBeGreaterThanOrEqual(10);
     expect(session.events().length).toBeLessThanOrEqual(4);
   });

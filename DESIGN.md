@@ -111,13 +111,13 @@ Each clause mirrors something React itself does with its hook update queues:
 (the patch tells us which lanes committed and which are still pending):
 
 - log entries whose lane just committed get their `foldedAtSeq` stamp, and the
-  newest of them becomes the atom's committed value — unless a newer write is
-  already part of committed state. Committed state is strictly
-  last-write-wins in write order: each atom remembers the ticket number of the
-  write it currently reflects (`baseSeq`), and a fold never rolls it back to
-  an older write. (Without this guard, committing an old transition after a
-  newer urgent write would resurrect the stale value — a confirmed bug during
-  review, now a regression test.)
+  committed value is recomputed by **replaying the log in write order** over
+  every entry that participates in committed state (folded entries plus
+  still-pending urgent writes). Replaying — rather than taking the newest
+  folded value — does two jobs at once: a fold can never roll committed state
+  back past a newer urgent write (a confirmed bug during review, now a
+  regression test), and pending functional updates re-apply on top of the
+  just-committed transition (see "Rebasing" below).
 - entries whose lane is no longer pending in any root we know about fold too:
   the work was discarded (say, the only subscriber unmounted), but the write
   still happened, so committed state must still converge to it;
@@ -136,10 +136,10 @@ roots) is a contained upgrade.
 
 ### Rebasing
 
-Because atoms are last-write-wins, the interleaving that forces
-react-concurrent-store to re-run reducers ("sync write while a transition is
-pending") needs no special machinery. Walk it through with `a` written by a
-transition and `b` written urgently while that transition is still pending:
+For plain `set` writes, the interleaving that forces react-concurrent-store to
+re-run reducers ("sync write while a transition is pending") needs no special
+machinery. Walk it through with `a` written by a transition and `b` written
+urgently while that transition is still pending:
 
 | log entry | lane | pending or committed? |
 |---|---|---|
@@ -156,6 +156,24 @@ transition and `b` written urgently while that transition is still pending:
 
 Each render's lane filter produces exactly the result React's own update-queue
 rebasing would produce for `useState`.
+
+**Functional updates** (`atom.update(fn)` and `ReducerAtom.dispatch(action)`)
+get the full useState/useReducer treatment: the log stores the *function*, not
+a computed value, and every place a value is derived — a render world, a fold,
+the sweep — replays visible entries **in write order**, feeding each updater
+the value accumulated so far in that world. So with `a = 1`, a pending
+transition `update(x => x + 1)`, and an urgent `update(x => x * 2)`:
+
+- the urgent render shows `1 * 2 = 2` (transition excluded — the doubling
+  applied to committed state);
+- when the transition commits, the fold replays: `+1` first (its position in
+  write order), then `* 2` on top — committed state becomes `4`, exactly what
+  two queued `setState` updaters produce in React.
+
+Updaters must be pure: one can run once per world that includes it (there is a
+side-by-side test dispatching identical actions through a `ReducerAtom` and a
+real `useReducer` across a held-open transition with urgent interleaving; the
+committed values match at every step).
 
 ## 3. Core graph (`src/core`, zero React imports)
 
@@ -551,7 +569,7 @@ sequenceDiagram
     participant E as Engine
     participant S as Subscription (one per useSignal)
     participant R as React
-    H->>E: startTransition(() => { count.state = 5 })
+    H->>E: startTransition(() => count.set(5))
     Note over E: Phase 1 — mark:<br/>walk downstream, leave "maybe stale"<br/>notes (HEAD plane), queue watchers.<br/>No user code runs.
     Note over E: Phase 2 — confirm:<br/>for each queued subscription, pull the<br/>watched computed in the written plane.<br/>Equality cutoff applies here.
     E->>S: confirmed: your computed really changed

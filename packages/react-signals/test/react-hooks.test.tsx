@@ -76,7 +76,7 @@ describe('useSignal basics', () => {
     const el = await mount(<Counter />);
     expect(el.textContent).toBe('0');
     await act(async () => {
-      count.state = 1;
+      count.set(1);
     });
     expect(el.textContent).toBe('1');
     expect(renders).toEqual([0, 1]);
@@ -94,12 +94,12 @@ describe('useSignal basics', () => {
     expect(el.textContent).toBe('1');
     expect(renders).toBe(1);
     await act(async () => {
-      n.state = 3; // parity unchanged → no broadcast, no render
+      n.set(3); // parity unchanged → no broadcast, no render
     });
     expect(el.textContent).toBe('1');
     expect(renders).toBe(1);
     await act(async () => {
-      n.state = 4;
+      n.set(4);
     });
     expect(el.textContent).toBe('0');
     expect(renders).toBe(2);
@@ -118,7 +118,7 @@ describe('useSignal basics', () => {
     );
     expect(el.textContent).toBe('00');
     await act(async () => {
-      a.state = 7;
+      a.set(7);
     });
     expect(el.textContent).toBe('77');
   });
@@ -136,7 +136,7 @@ describe('transitions', () => {
           <button
             onClick={() =>
               startTransition(() => {
-                item.state = 'banana';
+                item.set('banana');
                 setLabel('B');
               })
             }
@@ -165,7 +165,7 @@ describe('transitions', () => {
     const gate = controlled();
     await act(async () => {
       startTransition(async () => {
-        count.state = 5;
+        count.set(5);
         await gate.promise;
       });
     });
@@ -193,7 +193,7 @@ describe('transitions', () => {
     const gate = controlled();
     await act(async () => {
       startTransition(async () => {
-        a.state = 1;
+        a.set(1);
         await gate.promise;
       });
     });
@@ -201,7 +201,7 @@ describe('transitions', () => {
 
     // Urgent write lands and commits alone: transition's change not shown.
     await act(async () => {
-      b.state = 1;
+      b.set(1);
     });
     expect(el.textContent).toBe('100');
 
@@ -235,7 +235,7 @@ describe('transitions', () => {
     const gate = controlled();
     await act(async () => {
       startTransition(async () => {
-        a.state = 'new';
+        a.set('new');
         await gate.promise;
       });
     });
@@ -271,7 +271,7 @@ describe('useComputed', () => {
     const el = await mount(<App factor={2} />);
     expect(el.textContent).toBe('20');
     await act(async () => {
-      base.state = 11; // signal dep: auto-tracked
+      base.set(11); // signal dep: auto-tracked
     });
     expect(el.textContent).toBe('22');
     await act(async () => {
@@ -294,7 +294,7 @@ describe('useSignalEffect', () => {
     await mount(<App />);
     expect(seen).toEqual([1]);
     await act(async () => {
-      a.state = 2;
+      a.set(2);
     });
     expect(seen).toEqual([1, 2]);
   });
@@ -315,7 +315,7 @@ describe('useSignalEffect', () => {
     const gate = controlled();
     await act(async () => {
       startTransition(async () => {
-        a.state = 2;
+        a.set(2);
         await gate.promise;
       });
     });
@@ -370,7 +370,7 @@ describe('suspense', () => {
 
     await act(async () => {
       startTransition(() => {
-        which.state = 'slow';
+        which.set('slow');
       });
     });
     // Transition render suspended: old content stays, no fallback.
@@ -395,7 +395,7 @@ describe('multiple roots', () => {
     expect(el1.textContent).toBe('0');
     expect(el2.textContent).toBe('0');
     await act(async () => {
-      a.state = 3;
+      a.set(3);
     });
     expect(el1.textContent).toBe('3');
     expect(el2.textContent).toBe('3');
@@ -412,7 +412,7 @@ describe('infinite loop protection', () => {
     function App() {
       const v = useSignal(a);
       React.useLayoutEffect(() => {
-        a.state = v + 1; // every commit synchronously schedules another
+        a.set(v + 1); // every commit synchronously schedules another
       });
       return <span>{v}</span>;
     }

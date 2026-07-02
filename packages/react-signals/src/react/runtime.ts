@@ -16,13 +16,15 @@ import {
   type RenderWorld,
   setWriteLaneProvider,
   setAmbientWorld,
+  setRenderGuard,
   pinRenderPass,
   unpinRenderPass,
   fold,
-  startBatch,
-  endBatch,
+  flushEffects,
   currentWriteSeq,
+  config,
 } from '../core/engine.ts';
+import { batch, wasExplicitlyConfigured } from '../core/api.ts';
 
 type PatchedReact = {
   unstable_subscribeToExternalRuntime(listener: {
@@ -74,6 +76,17 @@ export function ensureInstalled(): void {
   installed = true;
   const R = patchedReact();
 
+  // Raw `atom.state` reads in render bodies are not reactive and bypass the
+  // render's world; catch them in development unless the app opted out.
+  setRenderGuard(() => R.unstable_getRenderContext() !== null);
+  if (
+    !wasExplicitlyConfigured('throwOnUntrackedReadsInRender') &&
+    typeof process !== 'undefined' &&
+    process.env.NODE_ENV !== 'production'
+  ) {
+    config.throwOnUntrackedReadsInRender = true;
+  }
+
   setWriteLaneProvider(() => {
     if (consumerCount === 0) return null;
     const lane = R.unstable_getCurrentUpdateLane();
@@ -105,20 +118,19 @@ export function ensureInstalled(): void {
       pendingLanesByContainer.set(container, remainingLanes);
       // Fold entries whose lane just committed, plus entries whose lane is no
       // longer pending in any root we know of (their subscribers unmounted or
-      // the work was superseded — the write still belongs in committed state,
-      // last-write-wins). Defer the effect flush out of React's commit.
-      startBatch();
-      try {
-        fold((entry) => {
-          if (R.unstable_lanesInclude(committedLanes, entry.lane)) return true;
-          for (const pending of pendingLanesByContainer.values()) {
-            if (R.unstable_lanesInclude(pending, entry.lane)) return false;
-          }
-          return true;
-        });
-      } finally {
-        queueMicrotask(endBatch);
-      }
+      // the work was superseded — the write still belongs in committed state).
+      // The fold's effect flush is deferred to a microtask so user effect
+      // code never runs inside React's commit phase; nothing else is held
+      // open — post-commit synchronous writes (layout effects, event
+      // handlers) deliver in their own context.
+      fold((entry) => {
+        if (R.unstable_lanesInclude(committedLanes, entry.lane)) return true;
+        for (const pending of pendingLanesByContainer.values()) {
+          if (R.unstable_lanesInclude(pending, entry.lane)) return false;
+        }
+        return true;
+      }, true);
+      queueMicrotask(flushEffects);
     },
   });
 }
@@ -159,4 +171,15 @@ export function readInRenderWorld<T>(fn: () => T): T {
 /** startTransition that works from any context (fixups). */
 export function startTransitionSafe(fn: () => void): void {
   React.startTransition(fn);
+}
+
+/**
+ * startTransition + batch: signal writes inside `scope` ride the transition
+ * lane AND coalesce into (at most) one notification per subscription instead
+ * of one per write. Async scopes work like React's startTransition — the
+ * batch covers the synchronous part; writes after an `await` need their own
+ * startSignalTransition, the same rule React applies to setState.
+ */
+export function startSignalTransition(scope: () => void | Promise<void>): void {
+  React.startTransition(() => batch(scope) as void | Promise<void>);
 }
