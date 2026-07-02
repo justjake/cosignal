@@ -1,0 +1,179 @@
+# v2 proposal: opaque batch tokens + a log-first engine rewrite
+
+Status: assessment/proposal (2026-07-02), not yet implemented. Prompted by two
+questions after the rebasing work landed: (1) would a from-scratch rewrite,
+knowing the rebase semantics, simplify the engine? (2) can the React patch
+express what the library needs without leaking lanes into userspace?
+
+Short answers: yes and yes — and they are one project, not two, because the
+opaque boundary reshapes the engine's world model into exactly the form that
+simplifies it.
+
+---
+
+## 1. Why the current engine is confusing (specifics)
+
+The engine is correct (95 tests, adversarial regressions) but grew in layers:
+first an eager two-plane cache model, then a write log for render worlds, then
+log replay for rebasing. The result is that **the same value is derived in
+four places that must agree**:
+
+| place | what it computes | mechanism |
+|---|---|---|
+| `writeAtomImpl` | eager BASE (`buffered`) and HEAD (`headValue`) | incremental apply at write time |
+| `resolveAtomInWorld` | a render pass's value | replay of visible log entries |
+| `fold` | new committed value | replay of folded + urgent entries |
+| `sweepLogs` | collapsed pre-log value | replay of the swept prefix |
+
+Three replay loops plus incremental eager updates that must stay equivalent to
+them. Every rebasing bug risk lives in that equivalence.
+
+Second source of confusion: **plane bookkeeping on computeds**. A computed
+carries `value/status/payload` twice (BASE and HEAD mirrors), plus three
+trust-tracking fields (`headGen`, `baseGen`, `evaluated` bitmask) whose only
+job is to answer "may I trust this mirror for the current fork?" — the
+`seedHead` rules. Two of the adversarial review's confirmed bugs were exactly
+these rules being subtly wrong. Per-plane dirty flags packed into one bitfield
+(with the "clear both when steady" hygiene rule) were a third bug class.
+
+None of this is essential complexity. The essential complexity is: multiple
+worlds exist concurrently; computeds cache per world; React timing decides
+when worlds merge. The accidental complexity is that "world" is spelled three
+different ways in the code (plane fields, log replays, RenderWorld objects).
+
+## 2. The rewrite shape: log as truth, worlds as keys
+
+Knowing what we know now, the clean formulation is:
+
+1. **The write log is the single source of truth for an atom.** One function
+   derives every value: `replay(atom, includes: (entry) => boolean)`.
+2. **A world is an opaque key** — "committed", "head", or a pinned render
+   pass — that maps to an `includes` predicate over log entries.
+3. **`buffered`/`headValue` become explicitly-memoized replays** for the two
+   hot world keys, with a stated invariant (cache equals replay, invalidated
+   by write/fold) instead of hand-maintained incremental updates scattered
+   through the write path.
+4. **Computed caches become a uniform small map: world key → result**
+   (value/error/suspended + a validity stamp). `seedHead`, `headGen`,
+   `baseGen`, and `evaluated` all collapse into "is there a valid entry for
+   this key?" — one mechanism replaces four fields and their interaction
+   rules. Steady mode keeps a single entry; forked mode two; pinned passes
+   use the existing per-pass slot.
+5. **Dirty tracking**: keep alien-signals push-pull marking, but mark a single
+   "possibly stale" bit; *which world* is stale is resolved at
+   confirmation/pull time by comparing per-world version stamps (an atom
+   bumps a committed-version on urgent writes/folds and a head-version on all
+   writes). This removes the per-plane flag bits, the per-plane clear-mask
+   hygiene, and the per-link plane-membership bits — the three most
+   bug-prone mechanisms per the review. (Perf note: this trades flag-bit
+   branch tables for version compares; the benchmark must arbitrate. If the
+   deep-chain numbers regress, per-link stamps can live in the existing
+   `Link` fields.)
+
+What would NOT change, because it is proven and orthogonal: the notification
+protocol (mark-all → confirm subscriptions → flush effects, batch-deferred),
+pins and fold-time visibility stamps, watched refcounts and the atom
+lifecycle, suspense-as-status, the tracing slots, the hooks and their mount
+fixup. The full test suite — especially the React integration scenarios and
+the useReducer side-by-side — is implementation-agnostic and carries over as
+the safety net.
+
+Estimated effect: engine ~1800 → ~1300 lines, but the real win is fewer
+invariants: "cache = replay(key)" is one sentence; the current plane-mirror
+trust rules are a page.
+
+## 3. The boundary: batch tokens instead of lanes
+
+Userspace currently touches lanes in five places: write attribution
+(`getCurrentUpdateLane` + `isTransitionLane`), entry visibility
+(`lanesInclude` against render lanes), fold decisions (`lanesInclude` against
+committed/remaining lanes), and the runtime's `pendingLanesByContainer`
+abandonment sweep. That is real coupling: we reason about React's bit
+assignment policy in userspace, and a React upgrade that changes lane
+semantics (e.g. `enableParallelTransitions`) means rewriting react-signals
+internals.
+
+It is also a latent correctness hole: **transition lane bits are recycled**
+(10 lanes, module-global cursor — notes/research/react-lanes-transitions.md
+§1.2/§3.2). A log entry stores a bare lane number, so an entry from
+transition #1 is indistinguishable from one belonging to transition #11 that
+reused the bit. Benign today only because all pending transition lanes render
+and commit as one batch; wrong the moment React parallelizes transitions.
+Bits are not identities. What the library actually needs are identities.
+
+### What the library actually needs (semantically)
+
+1. **At write time**: an identity for the *batch* this write belongs to, and
+   one bit of classification — is the batch *deferred* (transition-like: its
+   renders won't block paint, it commits later) or *immediate*?
+2. **At render time**: which batch identities does this render pass include?
+3. **At retirement**: this batch committed (fold its writes) or was abandoned
+   (fold-or-drop per policy) — exactly once, per identity.
+
+### Proposed patch API (replaces the lane surface)
+
+```ts
+type BatchToken = opaque object; // identity, never recycled
+
+// Write attribution (replaces getCurrentUpdateLane + isTransitionLane):
+unstable_getCurrentWriteBatch(): { token: BatchToken; deferred: boolean };
+
+// Render lifecycle (replaces renderLanes + lanesInclude):
+onRenderPassStart(container, includes: ReadonlySet<BatchToken>): void;
+onRenderPassEnd(container): void;
+
+// Retirement (replaces onCommit's committedLanes/remainingLanes and the
+// userspace abandonment sweep):
+onCommit(container): void; // ordering signal for fold timing
+onBatchRetired(token: BatchToken, committed: boolean): void;
+```
+
+React-side, the patch maintains a small registry mapping (root, lane,
+generation) → token: a token is created when a lane is claimed for an event
+(`requestTransitionLane` / event-priority flush), included-sets are computed
+from render lanes at `prepareFreshStack`, and retirement fires from
+`markRootFinished` (committed) or when a lane leaves `pendingLanes`
+uncommitted (abandoned). All lane lifetime reasoning moves inside
+`vendor/react`, next to the code it depends on — which is where it gets
+maintained when the patch is rebased onto a new React. Userspace log entries
+store a token reference; visibility is `entry.token ∈ pass.includes` or
+"retired-committed before my pin"; folds are driven by explicit retirement
+events. The `pendingLanesByContainer` map and every bitwise operation in
+runtime.ts disappear.
+
+A **contract test file** (userspace side, driving the token API through real
+React renders: deferred write → not visible to urgent pass → visible to its
+own pass → retired-committed exactly once; abandoned batch retires
+uncommitted; recycled-lane scenarios get distinct tokens) becomes the
+definition of the boundary. Rebasing the React patch = making that suite pass
+again, with zero userspace changes. That's the upgrade story asked for.
+
+## 4. Recommendation
+
+Do both together, as one change, in this order:
+
+1. Add the token registry to the patch + the contract test suite (the lane
+   APIs can remain temporarily as the tokens' implementation detail).
+2. Rewrite the engine log-first with worlds-as-keys (§2), consuming tokens.
+   Keep the notification protocol and all public APIs unchanged.
+3. The existing 95-test suite + benchmark conformance gate the swap; the
+   forked-overhead benchmark variant tells us whether version-stamp dirt
+   tracking holds the perf line.
+
+Scope estimate: patch +~150 lines (registry + events), engine rewrite ~1300
+lines replacing ~1800, runtime.ts shrinks by roughly half, bindings and
+public API untouched. Risk is moderate and mostly covered by the regression
+suite; the main open perf question is flag-bits vs version-stamps on deep
+chains.
+
+## 5. If we don't rewrite yet: cheap contained cleanups
+
+- Extract the three replay loops into one `replayLog(atom, includes)` helper
+  (mechanical; removes the equivalence risk).
+- Unify `unwrapResult` / `unwrapResultOrThrow` / `unwrapCached` (three copies
+  of the same status switch).
+- Extract the shared eager-plane-update block from `writeAtomImpl`'s two
+  branches.
+- Move all lane touching in runtime.ts behind a tiny `BatchAdapter` interface
+  — the token API's shape, implemented over lanes — so the engine stops
+  seeing lanes even before the patch changes.
