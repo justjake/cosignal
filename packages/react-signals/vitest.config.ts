@@ -5,6 +5,7 @@ export default defineConfig({
     setupFiles: ['./test/setup.ts'],
     environmentMatchGlobs: [
       ['test/react*.test.tsx', 'jsdom'],
+      ['test/mutation-observer.test.tsx', 'jsdom'],
       ['test/patch-smoke.test.ts', 'jsdom'],
       ['test/**', 'node'],
     ],

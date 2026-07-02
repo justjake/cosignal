@@ -21,6 +21,13 @@ importers:
         version: 3.9.4
 
   packages/react-signals:
+    dependencies:
+      react:
+        specifier: link:../../vendor/react/build/oss-experimental/react
+        version: link:../../vendor/react/build/oss-experimental/react
+      react-dom:
+        specifier: link:../../vendor/react/build/oss-experimental/react-dom
+        version: link:../../vendor/react/build/oss-experimental/react-dom
     devDependencies:
       '@testing-library/react':
         specifier: ^16.3.2
@@ -34,12 +41,6 @@ importers:
       jsdom:
         specifier: ^29.1.1
         version: 29.1.1
-      react:
-        specifier: link:../../vendor/react/build/oss-experimental/react
-        version: link:../../vendor/react/build/oss-experimental/react
-      react-dom:
-        specifier: link:../../vendor/react/build/oss-experimental/react-dom
-        version: link:../../vendor/react/build/oss-experimental/react-dom
       typescript:
         specifier: ^5.8.3
         version: 5.9.3
