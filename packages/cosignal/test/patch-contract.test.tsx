@@ -19,7 +19,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import * as React from 'react';
-import { act, startTransition, useState } from 'react';
+import { act, startTransition, use, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 
 type Token = { deferred: boolean; id: number };
@@ -280,5 +280,88 @@ describe('render inclusion', () => {
     });
     // The transition's own render includes t.
     expect(passes.some((p) => p.included.includes(t))).toBe(true);
+  });
+});
+
+describe('async actions', () => {
+  test('a store-only async action keeps its batch pending until the action settles', async () => {
+    // startTransition(async scope) with ONLY store writes before the first
+    // await: no React work is ever scheduled, but the batch must not retire
+    // at event close — the action is still open, and retiring would leak the
+    // store writes into committed state mid-action.
+    const gate = controlled();
+    let token!: Token;
+    startTransition(async () => {
+      token = R.unstable_getCurrentWriteBatch();
+      await gate.promise;
+    });
+    await new Promise<void>((r) => setTimeout(r)); // event close edge runs
+    expect(token.deferred).toBe(true);
+    expect(retired.map((r) => r.token)).not.toContain(token);
+
+    gate.resolve();
+    await act(async () => {
+      await gate.promise;
+    });
+    await new Promise<void>((r) => setTimeout(r)); // settle callbacks run
+    const record = retired.find((r) => r.token === token);
+    expect(record).toBeDefined();
+    expect(record!.committed).toBe(false); // still store-only work
+  });
+});
+
+describe('multiple roots', () => {
+  test('a root that committed a still-pending batch keeps including it (per-root lock-in)', async () => {
+    // One transition updates two roots; root B suspends so the batch stays
+    // pending there while root A commits. Until the batch fully retires,
+    // renders on A must keep including its token — A's committed tree
+    // already shows the batch, and excluding it would tear urgent renders
+    // on A against A's own DOM.
+    const gate = controlled();
+    let setA!: (v: boolean) => void;
+    let bumpA!: (n: number) => void;
+    let setB!: (v: boolean) => void;
+    function CompA() {
+      const [on, set] = useState(false);
+      const [, setN] = useState(0);
+      setA = set;
+      bumpA = setN;
+      return <span>{String(on)}</span>;
+    }
+    function CompB() {
+      const [on, set] = useState(false);
+      setB = set;
+      if (on) use(gate.promise); // suspends the transition render on B
+      return <span>{String(on)}</span>;
+    }
+    const elA = await mount(<CompA />);
+    await mount(<CompB />);
+
+    let token!: Token;
+    await act(async () => {
+      startTransition(() => {
+        token = R.unstable_getCurrentWriteBatch();
+        setA(true);
+        setB(true);
+      });
+    });
+    // A committed the transition; B is suspended on the gate.
+    expect(elA.textContent).toBe('true');
+    expect(retired.map((r) => r.token)).not.toContain(token);
+
+    // An urgent render on A includes the committed-but-unretired batch.
+    passes.length = 0;
+    await act(async () => {
+      bumpA(1);
+    });
+    expect(passes.some((p) => p.included.includes(token))).toBe(true);
+
+    // B settles: the batch commits everywhere and retires exactly once.
+    gate.resolve();
+    await act(async () => {
+      await gate.promise;
+    });
+    expect(retired.filter((r) => r.token === token)).toHaveLength(1);
+    expect(retired.find((r) => r.token === token)!.committed).toBe(true);
   });
 });
