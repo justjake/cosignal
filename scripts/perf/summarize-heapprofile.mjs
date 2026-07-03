@@ -10,8 +10,7 @@ const rows = new Map();
 let total = 0;
 function walk(node) {
   const f = node.callFrame;
-  let self = 0;
-  for (const s of node.selfSize !== undefined ? [node.selfSize] : []) self += s;
+  const self = node.selfSize ?? 0;
   if (self > 0) {
     const name = f.functionName || '(anonymous)';
     const url = (f.url || '').replace(/^.*\/(packages|node_modules)\//, '$1/');

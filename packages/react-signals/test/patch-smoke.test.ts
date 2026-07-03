@@ -1,47 +1,68 @@
 // @vitest-environment jsdom
+// Smoke test for the React patch's external-runtime surface: batch-token
+// classification/minting and the lifecycle events. The full protocol contract
+// (retirement edges, abandonment, merging) lives in patch-contract.test.tsx.
 import { expect, test } from 'vitest';
 import * as React from 'react';
 import { createRoot } from 'react-dom/client';
 import { act } from 'react';
 
-test('external runtime lanes + lifecycle events', async () => {
+type BatchToken = { deferred: boolean; id: number };
+
+test('external runtime batch tokens + lifecycle events', async () => {
   const R = React as any;
   const events: string[] = [];
+  const retired: BatchToken[] = [];
   const unsub = R.unstable_subscribeToExternalRuntime({
-    onRenderPassStart: (c: unknown, lanes: number) => events.push(`start:${lanes}`),
+    onRenderPassStart: (c: unknown, includedBatches: readonly unknown[]) =>
+      events.push(`start:${includedBatches.length}`),
     onRenderPassEnd: () => events.push('end'),
-    onCommit: (c: unknown, lanes: number, remaining: number) => events.push(`commit:${lanes}:${remaining}`),
     onBeforeMutation: () => events.push('beforeMut'),
     onAfterMutation: () => events.push('afterMut'),
+    onBatchRetired: (token: BatchToken, committed: boolean) => {
+      retired.push(token);
+      events.push(`retired:${committed}`);
+    },
   });
 
-  const urgent = R.unstable_getCurrentUpdateLane();
-  expect(R.unstable_isTransitionLane(urgent)).toBe(false);
-  let tLane = 0;
-  React.startTransition(() => { tLane = R.unstable_getCurrentUpdateLane(); });
-  expect(R.unstable_isTransitionLane(tLane)).toBe(true);
-  expect(R.unstable_lanesInclude(tLane, tLane)).toBe(true);
-  expect(R.unstable_lanesInclude(urgent, tLane)).toBe(false);
+  // Write classification is pure and context-sensitive: immediate outside a
+  // transition, deferred inside one.
+  expect(R.unstable_isCurrentWriteDeferred()).toBe(false);
+  let deferredInTransition = false;
+  let t1: BatchToken | null = null;
+  let t2: BatchToken | null = null;
+  React.startTransition(() => {
+    deferredInTransition = R.unstable_isCurrentWriteDeferred();
+    t1 = R.unstable_getCurrentWriteBatch();
+    t2 = R.unstable_getCurrentWriteBatch();
+  });
+  expect(deferredInTransition).toBe(true);
+  expect(t1).not.toBeNull();
+  expect(t1!.deferred).toBe(true);
+  expect(t2).toBe(t1); // token identity is stable within the batch
+
+  // A token minted without any React work still retires via the close edge.
+  await act(async () => {});
+  expect(retired).toContain(t1);
 
   const el = document.createElement('div');
   const root = createRoot(el);
-  let renderLanes = -1;
+  let sawRenderContext = false;
   function App() {
-    const ctx = R.unstable_getRenderContext();
-    renderLanes = ctx === null ? -1 : ctx.renderLanes;
+    sawRenderContext = R.unstable_getRenderContext() !== null;
     return React.createElement('span', null, 'hi');
   }
-  await act(async () => { root.render(React.createElement(App)); });
+  await act(async () => {
+    root.render(React.createElement(App));
+  });
   expect(el.textContent).toBe('hi');
-  expect(renderLanes).toBeGreaterThan(0);
-  expect(events.some(e => e.startsWith('start:'))).toBe(true);
+  expect(sawRenderContext).toBe(true);
+  expect(R.unstable_getRenderContext()).toBeNull(); // only during render
+  expect(events.some((e) => e.startsWith('start:'))).toBe(true);
   expect(events).toContain('end');
   expect(events).toContain('beforeMut');
   expect(events).toContain('afterMut');
-  expect(events.some(e => e.startsWith('commit:'))).toBe(true);
-  // Bracket ordering: beforeMut before afterMut before commit
+  // Mutation bracket closes before the commit's batches retire.
   expect(events.indexOf('beforeMut')).toBeLessThan(events.indexOf('afterMut'));
-  expect(events.indexOf('afterMut')).toBeLessThanOrEqual(events.indexOf(events.find(e => e.startsWith('commit:'))!));
   unsub();
-  console.log('EVENTS:', events.join(' | '));
 });

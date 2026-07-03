@@ -291,12 +291,11 @@ recipe + helper). No `getServerSnapshot` analogue needed — reads are plain.
 
 ## 5. Tracing (`react-signals/tracing`, lazy)
 
-Event schema with causality: every event has `id`, `ts`, `cause` (id of the
-triggering event) and a type-specific payload — `atom-write`, `invalidate`,
-`computed-eval` (+ reason: pull|validate), `broadcast` (lane, subscriber
-count), `render-read` (world decision), `fold`, `effect-run`, `atom-observed`
-/ `atom-unobserved`, `suspend`/`resolve`. Loading the module installs the
-tracer into the core slot; a ring buffer plus subscription API feed the future
+Event schema with causality: every event has `id`, `time`, `cause` (id of the
+triggering event) and a type-specific payload — `atom-write`, `computed-eval`,
+`notify`, `effect-run`, `retire` (a batch's writes joined committed state),
+`render-read`, `suspend`, `settle`. Loading the module installs the tracer
+into the core slot; a ring buffer plus subscription API feed the future
 devtools timeline; helpers answer "why did X re-run" by walking cause chains.
 Zero overhead unless loaded (single null check per site).
 
@@ -321,27 +320,34 @@ Two independent features, both following the established
 `ReactSharedInternals` renderer-registration pattern (the `S`/
 `onStartTransitionFinish` precedent — the reconciler fills slots on the shared
 object at module init; isomorphic code calls them; multiple renderers chain).
-No Fiber shapes cross the boundary; lanes pass as documented-opaque numbers;
-roots pass as opaque tokens (identity only).
+No Fiber shapes and no lane bits cross the boundary; batches pass as opaque
+tokens (stable identities minted by the patch's batch registry, see
+notes/design/01-v2-batch-tokens-and-rewrite.md); roots pass as their
+container (identity only).
 
 ### 6.1 Concurrent lifecycle for external state (`unstable_externalRuntime`)
 
 Registry callbacks (library subscribes once):
 
-- `onRenderPassStart(root, lanes)` / `onRenderPassEnd(root)` — brackets a
-  render *pass* (fresh stack → completion/discard), spanning yields. Drives
-  epoch pins.
-- `onCommit(root, committedLanes, remainingLanes)` — drives folding, effect
-  scheduling, watcher sweeps.
+- `onRenderPassStart(root, includedBatches)` / `onRenderPassEnd(root)` —
+  brackets a render *pass* (fresh stack → completion/discard), spanning
+  yields. `includedBatches` are the tokens of every live batch the pass
+  renders. Drives render-world pins.
+- `onBatchRetired(token, committed)` — exactly once per token, when the
+  batch's updates leave React's books (commit, unmount-pruned work, or a
+  batch that never produced React work). Drives retirement, effect
+  scheduling, and log sweeps.
 
 Queries:
 
-- `getCurrentUpdateLane()` — the lane `requestUpdateLane` would assign right
-  now (transition scope / async-action entangled lane / event priority).
-  Stamped on write-log entries at broadcast time.
-- `getRenderContext()` — `null` outside render; `{root, lanes}` during render.
-  Drives the read rule and "inside render" detection.
-- `laneIntersects(lanes, lane)` — subset test without exposing bit layout.
+- `isCurrentWriteDeferred()` — would a write issued right now belong to a
+  deferred (transition-like) batch? Pure classification, no allocation; the
+  engine's observability gate runs on this before asking for a token.
+- `getCurrentWriteBatch()` — the token for the batch a write issued right now
+  belongs to (minted lazily, stable for the batch's life). Stamped on write-
+  log entries.
+- `getRenderContext()` — `null` outside render; `{container, renderLanes}`
+  during render. Drives the read rule and "inside render" detection.
 
 ### 6.2 DOM mutation window
 
@@ -456,12 +462,12 @@ flowchart LR
     end
     C["Steady state again<br/>one plane<br/>count = 5"]
     A -- "startTransition writes count = 5" --> FORKED
-    FORKED -- "React commits the transition ('fold')" --> C
+    FORKED -- "React commits the transition (the batch retires)" --> C
 ```
 
-The fork is temporary. When React commits the transition, the pending writes
-"fold" into committed state, the two planes agree again, and the engine goes
-back to being a plain single-plane signals library. Code that never uses
+The fork is temporary. When React commits the transition, its batch "retires":
+the pending writes join committed state, the two planes agree again, and the
+engine goes back to being a plain single-plane signals library. Code that never uses
 transitions (or never uses React at all) never forks — that's why the
 benchmark numbers stay close to alien-signals.
 

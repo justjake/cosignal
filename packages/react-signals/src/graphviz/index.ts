@@ -26,17 +26,20 @@ import {
   type Link,
   type AtomNode,
   type ComputedNode,
+  type ComputedResult,
   type WatcherNode,
   KIND_ATOM,
   KIND_COMPUTED,
   WATCHER_EFFECT,
   PLANE_COMMITTED,
   PLANE_HEAD,
+  PLANE_BOTH,
   WORLD_COMMITTED,
   WORLD_HEAD,
   STATUS_ERROR,
   STATUS_SUSPENDED,
   F,
+  findResult,
   isForked,
 } from '../core/engine.ts';
 
@@ -51,16 +54,19 @@ function q(text: string): string {
 
 function summarize(value: unknown): string {
   let text: string;
-  try {
-    text = typeof value === 'string' ? JSON.stringify(value) : String(value);
-  } catch {
-    text = '<unprintable>';
-  }
-  if (typeof value === 'object' && value !== null) {
+  if (typeof value === 'string') {
+    text = JSON.stringify(value);
+  } else if (typeof value === 'object' && value !== null) {
     try {
-      text = JSON.stringify(value) ?? String(value);
+      text = JSON.stringify(value) ?? Object.prototype.toString.call(value);
     } catch {
       text = Object.prototype.toString.call(value);
+    }
+  } else {
+    try {
+      text = String(value);
+    } catch {
+      text = '<unprintable>';
     }
   }
   return text.length > 28 ? text.slice(0, 25) + '…' : text;
@@ -98,10 +104,10 @@ export type DependencyGraphOptions = {
  *   (effects / component subscriptions).
  * - Labels show current values. While the engine is forked (a transition
  *   write is pending), atoms and computeds show both planes:
- *   `BASE` (what the screen shows) and `HEAD` (including pending
+ *   `COMMITTED` (what the screen shows) and `HEAD` (including pending
  *   transitions). Stale-flag markers (`Pending`, `Dirty`, …) appear when set.
  * - While forked, edges are colored by which plane they exist in:
- *   gray = both planes, blue = BASE only, orange dashed = HEAD only
+ *   gray = both planes, blue = COMMITTED only, orange dashed = HEAD only
  *   (dependency sets can differ between planes; DESIGN.md §9.3).
  *
  * Reading node values does not disturb the graph: this renders raw fields and
@@ -168,21 +174,24 @@ function flagMarkers(node: Node): string {
   return parts.length > 0 ? `\n[${parts.join(' ')}]` : '';
 }
 
-function computedResult(status: number, value: unknown, payload: unknown): string {
-  if (status === STATUS_ERROR) return `error: ${summarize(payload)}`;
-  if (status === STATUS_SUSPENDED) return 'suspended…';
-  return summarize(value);
+function summarizeResult(entry: ComputedResult | null, fallback: string): string {
+  if (entry === null) return fallback;
+  if (entry.status === STATUS_ERROR) return `error: ${summarize(entry.payload)}`;
+  if (entry.status === STATUS_SUSPENDED) return 'suspended…';
+  return summarize(entry.value);
+}
+
+/** The `COMMITTED: x | HEAD: y` label line shown while forked. */
+function planePair(committed: string, head: string): string {
+  return `COMMITTED: ${committed} | HEAD: ${head}`;
 }
 
 function nodeAttrs(node: Node, forked: boolean): string {
   if (node.kind === KIND_ATOM) {
     const atom = node as AtomNode;
-    let valueLine: string;
-    if (forked) {
-      valueLine = `COMMITTED: ${summarize(atom.committedLatest)} | HEAD: ${summarize(atom.headLatest)}`;
-    } else {
-      valueLine = summarize(atom.committedLatest);
-    }
+    const valueLine = forked
+      ? planePair(summarize(atom.committedLatest), summarize(atom.headLatest))
+      : summarize(atom.committedLatest);
     const pendingLog =
       atom.log !== null && atom.log.length > 0 ? `\nlog: ${atom.log.length} entries` : '';
     const label = `${nodeDisplayName(node)}\n${valueLine}${pendingLog}${flagMarkers(node)}`;
@@ -190,19 +199,10 @@ function nodeAttrs(node: Node, forked: boolean): string {
   }
   if (node.kind === KIND_COMPUTED) {
     const c = node as ComputedNode;
-    const committed = c.results.find((r) => r.world === WORLD_COMMITTED);
-    let valueLine =
-      committed !== undefined
-        ? computedResult(committed.status, committed.value, committed.payload)
-        : '(not yet evaluated)';
-    if (forked) {
-      const head = c.results.find((r) => r.world === WORLD_HEAD);
-      valueLine = `COMMITTED: ${valueLine} | HEAD: ${
-        head !== undefined
-          ? computedResult(head.status, head.value, head.payload)
-          : '(not seeded)'
-      }`;
-    }
+    const committed = summarizeResult(findResult(c, WORLD_COMMITTED), '(not yet evaluated)');
+    const valueLine = forked
+      ? planePair(committed, summarizeResult(findResult(c, WORLD_HEAD), '(not seeded)'))
+      : committed;
     const label = `${nodeDisplayName(node)}\n${valueLine}${flagMarkers(node)}`;
     return `[shape=ellipse, style=filled, fillcolor="#dcfce7", label="${q(label)}"]`;
   }
@@ -211,7 +211,7 @@ function nodeAttrs(node: Node, forked: boolean): string {
 }
 
 function edgeAttrs(link: Link, forked: boolean): string {
-  if (!forked || link.planes === (PLANE_COMMITTED | PLANE_HEAD)) {
+  if (!forked || link.planes === PLANE_BOTH) {
     return '[color="#6b7280"]';
   }
   if ((link.planes & PLANE_COMMITTED) !== 0) {
@@ -240,13 +240,10 @@ const EVENT_COLORS: Record<string, string> = {
   'computed-eval': '#dcfce7',
   notify: '#ffedd5',
   'effect-run': '#fee2e2',
-  fold: '#f3e8ff',
+  retire: '#f3e8ff',
   'render-read': '#e0f2fe',
   suspend: '#fef9c3',
   settle: '#fef9c3',
-  invalidate: '#f3f4f6',
-  'atom-observed': '#f3f4f6',
-  'atom-unobserved': '#f3f4f6',
 };
 
 /**

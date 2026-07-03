@@ -22,11 +22,11 @@
  */
 
 import * as React from 'react';
-import { useLayoutEffect, useReducer } from 'react';
+import { startTransition, useLayoutEffect, useReducer } from 'react';
 import type { Atom, Computed } from '../core/api.ts';
 import {
-  type Node,
-  type WatcherNode,
+  type AtomNode,
+  type ComputedNode,
   KIND_ATOM,
   WATCHER_SUBSCRIPTION,
   PLANE_COMMITTED,
@@ -37,15 +37,10 @@ import {
   readAtom,
   readComputed,
   peekNodeValue,
+  isForked,
   SuspendedRead,
 } from '../core/engine.ts';
-import {
-  addConsumer,
-  removeConsumer,
-  ensureInstalled,
-  readInRenderWorld,
-  startTransitionSafe,
-} from './runtime.ts';
+import { addConsumer, removeConsumer, ensureInstalled, readInRenderWorld } from './runtime.ts';
 
 function bump(count: number): number {
   return count + 1;
@@ -53,14 +48,16 @@ function bump(count: number): number {
 
 export function useSignal<T>(signal: Atom<T> | Computed<T>): T {
   ensureInstalled();
-  const node: Node = signal.node;
+  const node = signal.node;
   const [, forceUpdate] = useReducer(bump, 0);
 
   let value: T;
   let suspended: SuspendedRead | null = null;
   try {
     value = readInRenderWorld(() =>
-      node.kind === KIND_ATOM ? (readAtom(node as never) as T) : (readComputed(node as never) as T),
+      node.kind === KIND_ATOM
+        ? (readAtom(node as AtomNode) as T)
+        : (readComputed(node as ComputedNode) as T),
     );
   } catch (e) {
     if (e instanceof SuspendedRead) {
@@ -72,26 +69,24 @@ export function useSignal<T>(signal: Atom<T> | Computed<T>): T {
 
   useLayoutEffect(() => {
     addConsumer();
-    const watcher: WatcherNode = createWatcher(WATCHER_SUBSCRIPTION, null, () => forceUpdate());
+    const watcher = createWatcher(WATCHER_SUBSCRIPTION, null, () => forceUpdate());
     subscribeTo(watcher, node);
 
     // Mount fixup: a write may have landed between this render and now
     // (before the subscription existed). Compare against what was rendered.
-    const isEqual = (signal as { node: { isEqual?: (a: unknown, b: unknown) => boolean } }).node
-      .isEqual;
-    const equal = isEqual ?? Object.is;
+    const equal = node.isEqual;
     if (suspended === null) {
       try {
         const base = peekNodeValue(node, PLANE_COMMITTED);
         if (!equal(base, value)) {
           // Urgent divergence: correct before paint (sync lane here).
           forceUpdate();
-        } else {
+        } else if (isForked()) {
           const head = peekNodeValue(node, PLANE_HEAD);
           if (!equal(head, base)) {
             // A transition is pending and this component wasn't part of its
             // broadcast; join it so we flip together when it commits.
-            startTransitionSafe(() => forceUpdate());
+            startTransition(() => forceUpdate());
           }
         }
       } catch {

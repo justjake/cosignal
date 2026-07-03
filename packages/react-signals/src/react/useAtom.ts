@@ -8,12 +8,7 @@
  */
 
 import { useState } from 'react';
-import {
-  Atom,
-  ReducerAtom,
-  type AtomOptions,
-  type ReducerAtomOptions,
-} from '../core/api.ts';
+import { Atom, ReducerAtom } from '../core/api.ts';
 
 export type UseAtomOptions<T> = {
   label?: string;
@@ -26,14 +21,13 @@ export type UseAtomOptions<T> = {
  * only consulted on mount. Pair with useSignal to read it reactively.
  */
 export function useAtom<T>(initialState: T | (() => T), options?: UseAtomOptions<T>): Atom<T> {
-  const [atom] = useState(() => {
-    const init: AtomOptions<T> = {
-      state: typeof initialState === 'function' ? (initialState as () => T)() : initialState,
-    };
-    if (options?.label !== undefined) init.label = options.label;
-    if (options?.isEqual !== undefined) init.isEqual = options.isEqual;
-    return new Atom<T>(init);
-  });
+  const [atom] = useState(
+    () =>
+      new Atom<T>({
+        ...options,
+        state: typeof initialState === 'function' ? (initialState as () => T)() : initialState,
+      }),
+  );
   return atom;
 }
 
@@ -49,14 +43,13 @@ export function useReducerAtom<S, A>(
   initialState: S | (() => S),
   options?: UseAtomOptions<S>,
 ): ReducerAtom<S, A> {
-  const [atom] = useState(() => {
-    const init: ReducerAtomOptions<S, A> = {
-      state: typeof initialState === 'function' ? (initialState as () => S)() : initialState,
-      reduce,
-    };
-    if (options?.label !== undefined) init.label = options.label;
-    if (options?.isEqual !== undefined) init.isEqual = options.isEqual;
-    return new ReducerAtom<S, A>(init);
-  });
+  const [atom] = useState(
+    () =>
+      new ReducerAtom<S, A>({
+        ...options,
+        state: typeof initialState === 'function' ? (initialState as () => S)() : initialState,
+        reduce,
+      }),
+  );
   return atom;
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the js-reactivity-benchmark suite N times for react-signals (+forked,
 # +alien-signals reference), aggregate best-of-N per test, and diff against a
-# stored baseline.
+# stored baseline. Only the three frameworks the diff reads are run
+# (BENCH_FRAMEWORKS filter); set BENCH_FRAMEWORKS= (empty) to run all 17.
 #   scripts/perf/bench.sh [repeats] [baseline.csv]
 # Writes results to notes/perf/latest.csv. To set a new baseline:
 #   cp notes/perf/latest.csv notes/perf/baseline.csv
@@ -10,6 +11,7 @@ REPEATS="${1:-3}"
 BASELINE="${2:-notes/perf/baseline.csv}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT/vendor/js-reactivity-benchmark"
+export BENCH_FRAMEWORKS="${BENCH_FRAMEWORKS-react-signals,alien-signals}"
 
 TMP=$(mktemp -d)
 for i in $(seq 1 "$REPEATS"); do
@@ -45,16 +47,13 @@ const parse = (f) => new Map(readFileSync(f, 'utf8').trim().split('\n').map((l) 
 const base = parse(process.argv[2]);
 const now = parse(process.argv[3]);
 console.log('delta vs baseline (negative = faster):');
-let worse = 0;
 for (const [key, t] of now) {
   const b = base.get(key);
   if (b === undefined) continue;
   const delta = ((t - b) / b) * 100;
   const flag = delta > 5 ? ' <-- REGRESSION?' : '';
-  if (delta > 5) worse++;
   console.log(`${delta >= 0 ? '+' : ''}${delta.toFixed(1).padStart(6)}%  ${key}  (${b} -> ${t})${flag}`);
 }
-process.exitCode = 0;
 JS
 else
   echo "(no baseline at $BASELINE; cp notes/perf/latest.csv there to set one)" >&2

@@ -10,7 +10,7 @@
  */
 
 import { useMemo } from 'react';
-import { Computed, type ComputedCtx, type ComputedOptions } from '../core/api.ts';
+import { Computed, type ComputedCtx } from '../core/api.ts';
 import { useSignal } from './useSignal.ts';
 
 export type UseComputedOptions<T> = {
@@ -27,11 +27,6 @@ export function useComputed<T>(
   // A Computed is inert until read, so creating one during render is pure;
   // computeds from discarded renders are never subscribed and get collected.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const computed = useMemo(() => {
-    const init: ComputedOptions<T> = { fn };
-    if (options?.label !== undefined) init.label = options.label;
-    if (options?.isEqual !== undefined) init.isEqual = options.isEqual;
-    return new Computed<T>(init);
-  }, deps);
+  const computed = useMemo(() => new Computed<T>({ ...options, fn }), deps);
   return useSignal(computed);
 }

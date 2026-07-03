@@ -5,17 +5,12 @@
  * The effect observes committed state only: writes made inside a transition
  * re-run it when the transition commits, not when the write happens —
  * matching useEffect's after-commit semantics. Re-runs triggered by signal
- * changes flush right after the commit that folded them (microtask); re-runs
+ * changes flush right after the commit that retired them (microtask); re-runs
  * from `deps` changes follow normal useEffect timing.
  */
 
 import { useEffect } from 'react';
-import {
-  WATCHER_EFFECT,
-  createWatcher,
-  disposeWatcher,
-  runEffect,
-} from '../core/engine.ts';
+import { effect as signalEffect } from '../core/api.ts';
 import { addConsumer, removeConsumer } from './runtime.ts';
 
 export function useSignalEffect(
@@ -24,10 +19,9 @@ export function useSignalEffect(
 ): void {
   useEffect(() => {
     addConsumer();
-    const watcher = createWatcher(WATCHER_EFFECT, effect, null);
-    runEffect(watcher);
+    const dispose = signalEffect(effect);
     return () => {
-      disposeWatcher(watcher);
+      dispose();
       removeConsumer();
     };
     // `effect` is intentionally captured per deps-change, like useEffect.

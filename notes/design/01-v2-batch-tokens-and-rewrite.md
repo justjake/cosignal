@@ -22,7 +22,7 @@ four places that must agree**:
 |---|---|---|
 | `writeAtomImpl` | eager BASE (`buffered`) and HEAD (`headValue`) | incremental apply at write time |
 | `resolveAtomInWorld` | a render pass's value | replay of visible log entries |
-| `fold` | new committed value | replay of folded + urgent entries |
+| `retireBatch` | new committed value | replay of retired + urgent entries |
 | `sweepLogs` | collapsed pre-log value | replay of the swept prefix |
 
 Three replay loops plus incremental eager updates that must stay equivalent to

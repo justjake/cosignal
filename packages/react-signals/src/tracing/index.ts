@@ -55,12 +55,23 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
   }
   active = true;
 
+  // Ring buffer: `start` indexes the oldest retained event; eviction is an
+  // overwrite + pointer bump, never an array shift.
   const capacity = options.bufferSize ?? 10_000;
-  const buffer: TraceEvent[] = [];
+  const buffer: (TraceEvent | undefined)[] = [];
+  let start = 0;
+  let size = 0;
   let dropped = 0;
   const byId = new Map<number, TraceEvent>();
   const listeners = new Set<(event: TraceEvent) => void>();
   let nextId = 1;
+
+  /** Retained events, oldest first. */
+  function retained(): TraceEvent[] {
+    const out: TraceEvent[] = new Array(size);
+    for (let i = 0; i < size; i++) out[i] = buffer[(start + i) % capacity]!;
+    return out;
+  }
 
   setTracer({
     emit(type, cause, node, data): number {
@@ -72,13 +83,16 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
         node,
         data,
       };
-      buffer.push(event);
-      byId.set(event.id, event);
-      if (buffer.length > capacity) {
-        const evicted = buffer.splice(0, buffer.length - capacity);
-        dropped += evicted.length;
-        for (const e of evicted) byId.delete(e.id);
+      if (size < capacity) {
+        buffer[(start + size) % capacity] = event;
+        size++;
+      } else {
+        byId.delete(buffer[start]!.id);
+        dropped++;
+        buffer[start] = event;
+        start = (start + 1) % capacity;
       }
+      byId.set(event.id, event);
       for (const listener of listeners) listener(event);
       return event.id;
     },
@@ -106,10 +120,12 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
       listeners.clear();
     },
     events() {
-      return buffer.slice();
+      return retained();
     },
     clear() {
       buffer.length = 0;
+      start = 0;
+      size = 0;
       byId.clear();
       dropped = 0;
     },
@@ -120,14 +136,14 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
     causeChain,
     eventsFor(signal) {
       const node = nodeOf(signal);
-      return buffer.filter((e) => e.node === node);
+      return retained().filter((e) => e.node === node);
     },
     countsFor(signal) {
       const node = nodeOf(signal);
       let evals = 0;
       let notifies = 0;
       let writes = 0;
-      for (const e of buffer) {
+      for (const e of retained()) {
         if (e.node !== node) continue;
         if (e.type === 'computed-eval' || e.type === 'effect-run') evals++;
         else if (e.type === 'notify') notifies++;

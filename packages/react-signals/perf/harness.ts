@@ -32,13 +32,13 @@ import {
   pinRenderPass,
   unpinRenderPass,
   retireBatch,
+  createRenderWorld,
   currentWriteSeq,
   createWatcher,
   subscribeTo,
   disposeWatcher,
   WATCHER_SUBSCRIPTION,
   type BatchRef,
-  type RenderWorld,
 } from '../src/core/engine.ts';
 
 const scenario = process.argv[2] ?? 'steady';
@@ -61,7 +61,9 @@ function run(name: string, iterate: () => void): void {
   console.log(`${name}: ${iterations} iterations in ${elapsed.toFixed(1)}s = ${opsPerSec} ops/s`);
 }
 
-function buildGraph(width: number) {
+/** Two computed layers over `width` atoms, all observed by effects. The
+ * effects keep the whole graph live; only the writable sources are needed. */
+function buildGraph(width: number): Atom<number>[] {
   const sources = Array.from({ length: width }, (_, i) => new Atom({ state: i }));
   const layer1 = sources.map(
     (s, i) => new Computed({ fn: () => s.state + sources[(i + 1) % width]!.state }),
@@ -70,13 +72,23 @@ function buildGraph(width: number) {
     (c, i) => new Computed({ fn: () => c.state * 2 + layer1[(i + 1) % width]!.state }),
   );
   let sink = 0;
-  const disposers = layer2.map((c) => effect(() => void (sink += c.state as number)));
-  return { sources, layer2, disposers, readSink: () => sink };
+  for (const c of layer2) effect(() => void (sink += c.state as number));
+  return sources;
+}
+
+/** Runs `write` attributed to `token`, as the React provider would. */
+function writeInBatch(token: BatchRef, write: () => void): void {
+  setWriteBatchProvider(() => token);
+  try {
+    write();
+  } finally {
+    setWriteBatchProvider(null);
+  }
 }
 
 switch (scenario) {
   case 'steady': {
-    const { sources } = buildGraph(50);
+    const sources = buildGraph(50);
     let n = 0;
     run('steady', () => {
       batch(() => {
@@ -109,10 +121,8 @@ switch (scenario) {
     // Enter forked mode permanently: one deferred write that never retires.
     const pin = new Atom({ state: 0 });
     const deferredBatch: BatchRef = { deferred: true };
-    setWriteBatchProvider(() => deferredBatch);
-    pin.set(1);
-    setWriteBatchProvider(null);
-    const { sources } = buildGraph(50);
+    writeInBatch(deferredBatch, () => pin.set(1));
+    const sources = buildGraph(50);
     let n = 0;
     run('forked', () => {
       batch(() => {
@@ -150,10 +160,8 @@ switch (scenario) {
     const sum = new Computed({ fn: () => (a.state as number) + (b.state as number) });
     const dispose = effect(() => void sum.state);
     const deferredBatch: BatchRef = { deferred: true };
-    setWriteBatchProvider(() => deferredBatch);
-    a.set(1); // fork; a has a pending deferred entry
-    setWriteBatchProvider(null);
-    const world: RenderWorld = { includes: [deferredBatch], maxSeq: currentWriteSeq(), seesDeferred: null };
+    writeInBatch(deferredBatch, () => a.set(1)); // fork; a has a pending deferred entry
+    const world = createRenderWorld([deferredBatch], currentWriteSeq());
     pinRenderPass(world.maxSeq);
     run('worldreads', () => {
       const prev = setAmbientWorld(world);
@@ -167,13 +175,11 @@ switch (scenario) {
   }
 
   case 'retire': {
-    const { sources } = buildGraph(20);
+    const sources = buildGraph(20);
     let n = 0;
     run('retire', () => {
       const token: BatchRef = { deferred: true };
-      setWriteBatchProvider(() => token);
-      sources[n % 20]!.set(n);
-      setWriteBatchProvider(null);
+      writeInBatch(token, () => sources[n % 20]!.set(n));
       retireBatch(token);
       n++;
     });

@@ -58,3 +58,34 @@ ROLLED BACK per the "no complexity without measured wins" rule.
   engine allocations in the steady and handler scenarios — V8's escape
   analysis already scalar-replaces the frames. Hand-optimizing would add
   complexity for a provably nonexistent win.
+
+### Experiment C — helper extraction on propagate/link hot paths (KEPT, A/B-validated)
+
+Context: the /simplify elegance pass extracted `isMutedSubscription(sub)`
+(used per link visit in propagate/shallowPropagate) and `effectivePlanes(mask)`
+(the steady-widens-to-both-planes rule, 5 call sites including readAtom/
+readComputed linking). Both sit on benchmarked hot paths, so the extraction
+was A/B tested rather than assumed free.
+
+Method: three best-of-3 samples against the stored baseline — two with the
+helpers, one with both manually inlined at every call site. alien-signals ran
+as the untouched control in all samples.
+
+Result: the inlined variant measured WORSE (large-web-app +9.0% vs +4.1–6.1%
+with helpers; wide-dense +10.1% vs +4.4–4.5%; forked app tests flipped from
+−5–7% to +1–9%) — but the control degraded in lockstep across successive
+samples (control wide-dense drifted −4.8% → +3.9% with zero code change),
+i.e. the machine slows under sustained back-to-back bench load. Conclusion:
+helper-vs-inline is indistinguishable from thermal drift; V8 inlines both
+forms. KEEP the helpers (more readable, provably not slower). The micro
+create/updateComputations "regressions" (+20–160%) appear identically in the
+control and flip sign between samples — pure noise on sub-3ms tests.
+
+Real, reproducible win from the same pass: createDataSignals −70% steady /
+−12–22% forked in every sample (Atom constructor no longer allocates a
+lifecycle ctx + three closures unless the atom has an `effect` option).
+
+Tooling: bench.sh now sets BENCH_FRAMEWORKS=react-signals,alien-signals (an
+opt-in filter added to the vendored config) — the suite previously ran all 17
+frameworks while the diff read 3, ~4× wall-clock for nothing. Override with
+BENCH_FRAMEWORKS= (empty) to run everything.

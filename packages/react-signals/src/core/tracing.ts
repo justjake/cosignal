@@ -13,13 +13,10 @@
 
 export type TraceEventType =
   | 'atom-write'
-  | 'atom-observed'
-  | 'atom-unobserved'
   | 'computed-eval'
-  | 'invalidate'
   | 'notify'
   | 'effect-run'
-  | 'fold'
+  | 'retire'
   | 'render-read'
   | 'suspend'
   | 'settle';

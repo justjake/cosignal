@@ -12,7 +12,6 @@ import {
   type AtomNode,
   type ComputedNode,
   type WatcherNode,
-  type ComputedCtx as EngineComputedCtx,
   WATCHER_EFFECT,
   createAtomNode,
   createComputedNode,
@@ -79,8 +78,14 @@ export type ComputedOptions<T> = {
 // Observed-lifecycle delivery (Atom `effect` option)
 // ---------------------------------------------------------------------------
 
+/**
+ * Stored directly on the engine node's `lifecycle` field (the engine treats
+ * it as opaque and only checks it against null at watched 0↔1 transitions).
+ * Only atoms with an `effect` option carry one.
+ */
 type LifecycleState = {
-  atom: Atom<unknown>;
+  effect: (ctx: AtomCtx<unknown>) => void | (() => void);
+  ctx: AtomCtx<unknown>;
   cleanup: (() => void) | null;
   /** Desired state as of the last watched-count transition. */
   wantMounted: boolean;
@@ -89,7 +94,6 @@ type LifecycleState = {
   scheduled: boolean;
 };
 
-const lifecycles = new WeakMap<AtomNode, LifecycleState>();
 let lifecycleQueue: LifecycleState[] = [];
 let lifecycleFlushScheduled = false;
 
@@ -105,7 +109,7 @@ function scheduleLifecycleFlush(): void {
       if (state.wantMounted === state.isMounted) continue; // flap coalesced
       if (state.wantMounted) {
         state.isMounted = true;
-        const result = state.atom.options.effect!(state.atom.lifecycleCtx);
+        const result = state.effect(state.ctx);
         state.cleanup = typeof result === 'function' ? result : null;
       } else {
         state.isMounted = false;
@@ -118,8 +122,8 @@ function scheduleLifecycleFlush(): void {
 }
 
 function onTransition(node: AtomNode, wantMounted: boolean): void {
-  const state = lifecycles.get(node);
-  if (state === undefined) return;
+  const state = node.lifecycle as LifecycleState | null;
+  if (state === null) return;
   state.wantMounted = wantMounted;
   if (!state.scheduled) {
     state.scheduled = true;
@@ -140,37 +144,35 @@ setAtomLifecycleDelivery(
 export class Atom<T> {
   /** Engine node; internal, also consumed by the React bindings. */
   readonly node: AtomNode;
-  readonly options: AtomOptions<T>;
-  readonly lifecycleCtx: AtomCtx<T>;
 
   constructor(options: AtomOptions<T>) {
-    this.options = options;
-    this.node = createAtomNode(
+    const node = createAtomNode(
       options.state,
       options.isEqual as ((a: unknown, b: unknown) => boolean) | undefined,
-      options.effect !== undefined ? options : null,
+      null,
       options.label,
     );
-    const self = this;
-    this.lifecycleCtx = {
-      get state(): T {
-        return untracked(() => readAtom(self.node)) as T;
-      },
-      set(value: T): void {
-        writeAtom(self.node, value);
-      },
-      update(fn: (current: T) => T): void {
-        applyAtom(self.node, fn as (prev: unknown) => unknown);
-      },
-    };
+    this.node = node;
     if (options.effect !== undefined) {
-      lifecycles.set(this.node, {
-        atom: this as Atom<unknown>,
+      const state: LifecycleState = {
+        effect: options.effect as LifecycleState['effect'],
+        ctx: {
+          get state(): unknown {
+            return untracked(() => readAtom(node));
+          },
+          set(value: unknown): void {
+            writeAtom(node, value);
+          },
+          update(fn: (current: unknown) => unknown): void {
+            applyAtom(node, fn);
+          },
+        },
         cleanup: null,
         wantMounted: false,
         isMounted: false,
         scheduled: false,
-      });
+      };
+      node.lifecycle = state;
     }
   }
 
@@ -248,11 +250,9 @@ export class ReducerAtom<S, A> extends Atom<S> {
   readonly reduce: (state: S, action: A) => S;
 
   constructor(options: ReducerAtomOptions<S, A>) {
-    const init: AtomOptions<S> = { state: options.state };
-    if (options.isEqual !== undefined) init.isEqual = options.isEqual;
-    if (options.label !== undefined) init.label = options.label;
+    const { reduce, ...init } = options;
     super(init);
-    this.reduce = options.reduce;
+    this.reduce = reduce;
   }
 
   dispatch(action: A): void {
@@ -272,9 +272,6 @@ export function isComputed(value: unknown): value is Computed<unknown> {
   return value instanceof Computed;
 }
 
-/** Engine ctx and public ctx are the same object shape. */
-export type { EngineComputedCtx };
-
 // ---------------------------------------------------------------------------
 // Effects and batching
 // ---------------------------------------------------------------------------
@@ -284,8 +281,8 @@ export type { EngineComputedCtx };
  * tracked signal's (committed) value changes. `fn` may return a cleanup that
  * runs before each re-run and on dispose. Returns a disposer.
  *
- * Effects observe the committed (BASE) world: pending transition writes do
- * not re-run effects until they fold.
+ * Effects observe the committed world: pending transition writes do not
+ * re-run effects until their batch retires.
  */
 export function effect(fn: () => void | (() => void)): () => void {
   const w: WatcherNode = createWatcher(WATCHER_EFFECT, fn, null);

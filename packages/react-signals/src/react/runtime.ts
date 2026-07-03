@@ -16,6 +16,7 @@ import * as React from 'react';
 import {
   type RenderWorld,
   type BatchRef,
+  createRenderWorld,
   isForked,
   hasActivePins,
   setWriteBatchProvider,
@@ -34,7 +35,6 @@ type PatchedReact = {
   unstable_subscribeToExternalRuntime(listener: {
     onRenderPassStart?: (container: unknown, includedBatches: readonly BatchRef[]) => void;
     onRenderPassEnd?: (container: unknown) => void;
-    onCommit?: (container: unknown) => void;
     onBatchRetired?: (token: BatchRef, committed: boolean) => void;
   }): () => void;
   unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
@@ -42,7 +42,10 @@ type PatchedReact = {
   unstable_isCurrentWriteDeferred(): boolean;
 };
 
+let patched: PatchedReact | null = null;
+
 function patchedReact(): PatchedReact {
+  if (patched !== null) return patched;
   const r = React as unknown as PatchedReact;
   if (typeof r.unstable_getCurrentWriteBatch !== 'function') {
     throw new Error(
@@ -50,6 +53,7 @@ function patchedReact(): PatchedReact {
         'is missing). See scripts/build-react.sh.',
     );
   }
+  patched = r;
   return r;
 }
 
@@ -102,11 +106,7 @@ export function ensureInstalled(): void {
     onRenderPassStart(container, includedBatches) {
       const previous = worldsByContainer.get(container);
       if (previous !== undefined) unpinRenderPass(previous.maxSeq);
-      const world: RenderWorld = {
-        includes: includedBatches,
-        maxSeq: currentWriteSeq(),
-        seesDeferred: null,
-      };
+      const world = createRenderWorld(includedBatches, currentWriteSeq());
       worldsByContainer.set(container, world);
       pinRenderPass(world.maxSeq);
     },
@@ -141,7 +141,7 @@ export function currentRenderWorld(): RenderWorld | null {
   if (ctx === null) return null;
   let world = worldsByContainer.get(ctx.container);
   if (world === undefined) {
-    world = { includes: EMPTY_BATCHES, maxSeq: currentWriteSeq(), seesDeferred: null };
+    world = createRenderWorld(EMPTY_BATCHES, currentWriteSeq());
     worldsByContainer.set(ctx.container, world);
     pinRenderPass(world.maxSeq);
   }
@@ -157,11 +157,6 @@ export function readInRenderWorld<T>(fn: () => T): T {
   } finally {
     setAmbientWorld(prev);
   }
-}
-
-/** startTransition that works from any context (fixups). */
-export function startTransitionSafe(fn: () => void): void {
-  React.startTransition(fn);
 }
 
 /**

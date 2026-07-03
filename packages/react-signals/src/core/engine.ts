@@ -140,9 +140,18 @@ function clearBits(plane: Plane): number {
   return forkCount > 0 ? dirtyBit(plane) | pendingBit(plane) : ALL_PLANE_BITS;
 }
 
+/**
+ * The plane mask an operation in `mask` actually touches: outside forked mode
+ * the planes are one, so any mask widens to both (links, marks, and prunes
+ * must agree on this or a later fork sees half-tracked state).
+ */
+function effectivePlanes(mask: number): number {
+  return forkCount > 0 ? mask : PLANE_BOTH;
+}
+
 export const KIND_ATOM = 0;
 export const KIND_COMPUTED = 1;
-export const KIND_WATCHER = 2;
+const KIND_WATCHER = 2;
 
 export type Link = {
   /** Tracking-run stamp: dedupes repeated reads within one evaluation. */
@@ -205,11 +214,12 @@ export type AtomNode = Node & {
   preLogValue: unknown;
   log: WriteEntry[] | null;
   isEqual: (a: unknown, b: unknown) => boolean;
-  /** Observed-lifecycle callback (Atom `effect` option), if configured. */
+  /** Observed-lifecycle state (Atom `effect` option), owned by api.ts; the
+   * engine only checks it against null at watched 0↔1 transitions. */
   lifecycle: unknown;
 };
 
-export const STATUS_VALUE = 0;
+const STATUS_VALUE = 0;
 export const STATUS_ERROR = 1;
 export const STATUS_SUSPENDED = 2;
 
@@ -218,8 +228,7 @@ export const STATUS_SUSPENDED = 2;
  * WORLD_HEAD, or a RenderWorld (identity-keyed). `gen` stamps which fork
  * generation the result belongs to: a HEAD result is only trustworthy in the
  * fork that produced it, and a COMMITTED result computed *during* a fork
- * excludes that fork's deferred writes (so it must not seed HEAD). This one
- * uniform rule replaces the old headGen/baseGen/evaluated field triplet.
+ * excludes that fork's deferred writes (so it must not seed HEAD).
  */
 export type ComputedResult = {
   world: object;
@@ -283,6 +292,10 @@ export type RenderWorld = {
   seesDeferred: boolean | null;
 };
 
+export function createRenderWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
+  return { includes, maxSeq, seesDeferred: null };
+}
+
 function worldIncludesBatch(world: RenderWorld, batch: BatchRef): boolean {
   const includes = world.includes;
   for (let i = 0; i < includes.length; i++) {
@@ -333,6 +346,15 @@ let subQueueIndex = 0;
  */
 let mutedSubscriptions = false;
 
+/** Should the current wave skip this subscriber? (See mutedSubscriptions.) */
+function isMutedSubscription(sub: Node): boolean {
+  return (
+    mutedSubscriptions &&
+    sub.kind === KIND_WATCHER &&
+    (sub as WatcherNode).watcherKind === WATCHER_SUBSCRIPTION
+  );
+}
+
 export type EngineConfig = {
   forbidWritesInComputeds: boolean;
   /** Throw on raw (untracked) signal reads while React renders; see api.ts. */
@@ -349,12 +371,9 @@ export function setRenderGuard(guard: (() => boolean) | null): void {
   renderGuard = guard;
 }
 
-function checkUntrackedRenderRead(node: Node): void {
+function checkUntrackedRenderRead(node: AtomNode | ComputedNode): void {
   if (config.throwOnUntrackedReadsInRender && renderGuard !== null && renderGuard()) {
-    const label =
-      node.kind === KIND_ATOM || node.kind === KIND_COMPUTED
-        ? ((node as AtomNode | ComputedNode).label ?? '(unlabeled)')
-        : '(watcher)';
+    const label = node.label ?? '(unlabeled)';
     throw new Error(
       `Untracked read of signal ${label} during render. Reads in render bodies ` +
         'must go through useSignal/useComputed so the component re-renders when ' +
@@ -384,9 +403,13 @@ export function setAmbientWorld(world: RenderWorld | null): RenderWorld | null {
 
 // Active render passes pin log entries (and pass cache results) against GC.
 const activePins: number[] = [];
-let minActivePin = Infinity;
 /** Computeds holding a render-pass cache result; swept on last unpin. */
 const passCachedNodes: ComputedNode[] = [];
+
+/** A world key that is a render pass (as opposed to a live view). */
+function isPassWorld(world: object): boolean {
+  return world !== WORLD_COMMITTED && world !== WORLD_HEAD;
+}
 
 /** True while any render pass is pinned (provider-side observability gate). */
 export function hasActivePins(): boolean {
@@ -395,21 +418,19 @@ export function hasActivePins(): boolean {
 
 export function pinRenderPass(maxSeq: number): void {
   activePins.push(maxSeq);
-  if (maxSeq < minActivePin) minActivePin = maxSeq;
 }
 export function unpinRenderPass(maxSeq: number): void {
   const i = activePins.indexOf(maxSeq);
   if (i !== -1) activePins.splice(i, 1);
-  minActivePin = activePins.length === 0 ? Infinity : Math.min(...activePins);
   if (activePins.length === 0) {
-    for (const node of passCachedNodes.splice(0)) {
+    for (const node of passCachedNodes) {
       // Drop render-pass entries; keep COMMITTED/HEAD entries.
       const results = node.results;
       for (let j = results.length - 1; j >= 0; j--) {
-        const w = results[j]!.world;
-        if (w !== WORLD_COMMITTED && w !== WORLD_HEAD) results.splice(j, 1);
+        if (isPassWorld(results[j]!.world)) results.splice(j, 1);
       }
     }
+    passCachedNodes.length = 0;
     sweepLogs();
   }
 }
@@ -426,18 +447,13 @@ export class CycleError extends Error {
 }
 
 /**
- * Thrown by read sites when a computed's current result is a pending
- * thenable. React bindings catch it and suspend via React's `use()`.
+ * Thrown when a read encounters a pending thenable: by read sites whose
+ * computed's current result is a suspension, and by ctx.use itself inside an
+ * evaluation. Evaluation catches it (the computed's result becomes
+ * STATUS_SUSPENDED); the React bindings catch it at read sites and suspend
+ * via React's `use()`.
  */
 export class SuspendedRead {
-  thenable: PromiseLike<unknown>;
-  constructor(thenable: PromiseLike<unknown>) {
-    this.thenable = thenable;
-  }
-}
-
-/** Internal control-flow signal thrown by ctx.use inside an evaluation. */
-class SuspendSignal {
   thenable: PromiseLike<unknown>;
   constructor(thenable: PromiseLike<unknown>) {
     this.thenable = thenable;
@@ -602,7 +618,7 @@ function endTracking(node: Node, frame: TrackFrame, plane: Plane): void {
   // Prune links not re-read this run: clear this run's plane membership and
   // drop links that belong to no plane. Outside forked mode there is only one
   // plane, so stale links are removed outright.
-  const clearMask = forkCount > 0 ? plane : PLANE_BOTH;
+  const clearMask = effectivePlanes(plane);
   const cursor = node.depsTail;
   let l = cursor !== undefined ? cursor.nextDep : node.deps;
   while (l !== undefined) {
@@ -649,11 +665,7 @@ function propagate(subsHead: Link, mask: number, cycleGuard: Node | undefined): 
           'Write inside a computed feeds back into that computed (dependency cycle).',
         );
       }
-      const isMutedSubscription =
-        mutedSubscriptions &&
-        sub.kind === KIND_WATCHER &&
-        (sub as WatcherNode).watcherKind === WATCHER_SUBSCRIPTION;
-      if (!isMutedSubscription && sub !== cycleGuard) {
+      if (!isMutedSubscription(sub) && sub !== cycleGuard) {
         const flags = sub.flags;
         const linkMask = l.planes & mask;
         const wantPending =
@@ -717,13 +729,7 @@ function shallowPropagate(subsHead: Link | undefined, plane: Plane): void {
   for (let l = subsHead; l !== undefined; l = l.nextSub) {
     if ((l.planes & plane) === 0) continue;
     const sub = l.sub;
-    if (
-      mutedSubscriptions &&
-      sub.kind === KIND_WATCHER &&
-      (sub as WatcherNode).watcherKind === WATCHER_SUBSCRIPTION
-    ) {
-      continue;
-    }
+    if (isMutedSubscription(sub)) continue;
     const flags = sub.flags;
     if ((flags & (pBit | dBit)) === pBit) {
       sub.flags = flags | dBit;
@@ -952,7 +958,7 @@ let evalThenables: unknown[] | null = null;
 // Computed results (world-keyed cache)
 // ---------------------------------------------------------------------------
 
-function findResult(c: ComputedNode, world: object): ComputedResult | null {
+export function findResult(c: ComputedNode, world: object): ComputedResult | null {
   if (world === WORLD_COMMITTED) return c.committed;
   const results = c.results;
   for (let i = 0; i < results.length; i++) {
@@ -991,7 +997,7 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
   try {
     value = c.fn(computedCtx);
   } catch (e) {
-    if (e instanceof SuspendSignal || e instanceof SuspendedRead) {
+    if (e instanceof SuspendedRead) {
       // A pending ctx.use, or a suspended dependency: this computed suspends
       // on the same thenable (payload identity stays stable for the cutoff).
       status = STATUS_SUSPENDED;
@@ -1053,17 +1059,14 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
 }
 
 /**
- * The trust rule for HEAD results (replacing the old headGen/baseGen/
- * evaluated triplet with the uniform `gen` stamp): a HEAD entry is valid
- * only within the fork generation that produced it. When missing or stale,
- * seed from the COMMITTED entry iff that entry predates this fork — a
- * COMMITTED result computed DURING the fork excludes the fork's deferred
- * writes and must not stand in for head state. Returns null when there is no
- * trustworthy seed (caller evaluates fresh).
+ * The trust rule for HEAD results: a HEAD entry is valid only within the fork
+ * generation that produced it. When missing or stale (`head` is the caller's
+ * already-located entry), seed from the COMMITTED entry iff that entry
+ * predates this fork — a COMMITTED result computed DURING the fork excludes
+ * the fork's deferred writes and must not stand in for head state. Returns
+ * null when there is no trustworthy seed (caller evaluates fresh).
  */
-function ensureHeadResult(c: ComputedNode): ComputedResult | null {
-  let head = findResult(c, WORLD_HEAD);
-  if (head !== null && head.gen === forkGen) return head;
+function ensureHeadResult(c: ComputedNode, head: ComputedResult | null): ComputedResult | null {
   const committed = findResult(c, WORLD_COMMITTED);
   if (committed !== null && committed.gen !== forkGen) {
     if (head === null) {
@@ -1106,7 +1109,7 @@ function attachSettleListener(c: ComputedNode, thenable: InstrumentedThenable, p
       const prevMuted = mutedSubscriptions;
       mutedSubscriptions = true;
       try {
-        propagate(c.subs, forkCount > 0 ? plane : PLANE_BOTH, undefined);
+        propagate(c.subs, effectivePlanes(plane), undefined);
       } finally {
         mutedSubscriptions = prevMuted;
       }
@@ -1139,7 +1142,7 @@ function useThenable(thenable: InstrumentedThenable): unknown {
     case 'rejected':
       throw t.reason;
     case 'pending':
-      throw new SuspendSignal(t);
+      throw new SuspendedRead(t);
     default: {
       t.status = 'pending';
       t.then(
@@ -1157,7 +1160,7 @@ function useThenable(thenable: InstrumentedThenable): unknown {
         },
       );
       if (tracer !== null) tracer.emit('suspend', currentCause, undefined, { thenable: t });
-      throw new SuspendSignal(t);
+      throw new SuspendedRead(t);
     }
   }
 }
@@ -1209,7 +1212,7 @@ export function readAtom(atom: AtomNode): unknown {
   const sub = activeSub;
   if (sub !== undefined) {
     if ((sub.flags & F.RecursedCheck) !== 0) {
-      link(atom, sub, forkCount > 0 ? activePlane : PLANE_BOTH);
+      link(atom, sub, effectivePlanes(activePlane));
     }
     if (activePlane === PLANE_HEAD && forkCount > 0) return atom.headLatest;
     return committedAtomValue(atom);
@@ -1260,11 +1263,11 @@ export function readComputed(c: ComputedNode): unknown {
   // non-render reads get latest-write ("head") semantics, matching atoms.
   const plane: Plane =
     forkCount === 0 ? PLANE_COMMITTED : sub !== undefined ? activePlane : PLANE_HEAD;
-  let entry = pullComputed(c, plane);
-  // The pull may have re-evaluated; re-fetch is only needed if it did (the
-  // entry object is mutated in place otherwise).
+  // pullComputed always returns the current entry: re-evaluation mutates the
+  // cached entry object in place.
+  const entry = pullComputed(c, plane);
   if (sub !== undefined && (sub.flags & F.RecursedCheck) !== 0) {
-    link(c, sub, forkCount > 0 ? plane : PLANE_BOTH);
+    link(c, sub, effectivePlanes(plane));
   }
   if (sub === undefined) deliverNotifications(); // lazy pulls may promote watchers
   return unwrapEntry(entry);
@@ -1283,7 +1286,7 @@ function pullComputed(c: ComputedNode, plane: Plane): ComputedResult {
   const world = planeWorld(plane);
   let entry = findResult(c, world);
   if (world === WORLD_HEAD && (entry === null || entry.gen !== forkGen)) {
-    entry = ensureHeadResult(c);
+    entry = ensureHeadResult(c, entry);
     if (entry === null) {
       updateComputed(c, plane); // no trustworthy seed: evaluate fresh
       return findResult(c, world)!;
@@ -1355,7 +1358,7 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
     // recurse through resolveComputedInWorld and share the pass cache.
     value = c.fn(computedCtx);
   } catch (e) {
-    if (e instanceof SuspendSignal || e instanceof SuspendedRead) {
+    if (e instanceof SuspendedRead) {
       status = STATUS_SUSPENDED;
       payload = e.thenable;
     } else {
@@ -1371,8 +1374,7 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
   let hadPassEntry = false;
   const results = c.results;
   for (let i = 0; i < results.length; i++) {
-    const w = results[i]!.world;
-    if (w !== WORLD_COMMITTED && w !== WORLD_HEAD) {
+    if (isPassWorld(results[i]!.world)) {
       hadPassEntry = true;
       break;
     }
@@ -1553,7 +1555,7 @@ function writeAtomImpl(
       atom.headLatest = atom.committedLatest;
     }
     if (mask !== 0 && atom.subs !== undefined) {
-      propagate(atom.subs, forkCount > 0 ? mask : PLANE_BOTH, cycleGuard);
+      propagate(atom.subs, effectivePlanes(mask), cycleGuard);
     }
     deliverNotifications();
   } finally {
@@ -1596,7 +1598,7 @@ function appendLog(
  */
 export function retireBatch(batch: BatchRef, deferEffectFlush = false): void {
   if (loggedAtoms.size === 0) return;
-  const cause = tracer !== null ? setCurrentCause(tracer.emit('fold', currentCause)) : 0;
+  const cause = tracer !== null ? setCurrentCause(tracer.emit('retire', currentCause)) : 0;
   const prevMuted = mutedSubscriptions;
   mutedSubscriptions = true;
   ++batchDepth;
@@ -1641,7 +1643,10 @@ export function retireBatch(batch: BatchRef, deferEffectFlush = false): void {
  */
 function sweepLogs(): void {
   if (loggedAtoms.size === 0) return;
-  const bound = minActivePin;
+  let bound = Infinity;
+  for (let i = 0; i < activePins.length; i++) {
+    if (activePins[i]! < bound) bound = activePins[i]!;
+  }
   for (const atom of loggedAtoms) {
     const log = atom.log;
     if (log === null) {
@@ -1740,13 +1745,7 @@ export function runEffect(w: WatcherNode): void {
   const cleanup = w.cleanup;
   w.cleanup = null;
   if (cleanup !== null) {
-    const prev = activeSub;
-    activeSub = undefined;
-    try {
-      cleanup();
-    } finally {
-      activeSub = prev;
-    }
+    untracked(cleanup);
     if (w.flags === F.None) return; // cleanup disposed the watcher
   }
   const frame = startTracking(w, PLANE_COMMITTED);
@@ -1815,15 +1814,7 @@ export function disposeWatcher(w: WatcherNode): void {
   w.cleanup = null;
   w.flags = F.None;
   w.queuedPlanes = 0;
-  if (cleanup !== null) {
-    const prev = activeSub;
-    activeSub = undefined;
-    try {
-      cleanup();
-    } finally {
-      activeSub = prev;
-    }
-  }
+  if (cleanup !== null) untracked(cleanup);
 }
 
 // ---------------------------------------------------------------------------
