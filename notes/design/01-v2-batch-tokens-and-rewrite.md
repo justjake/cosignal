@@ -95,11 +95,29 @@ internals.
 
 It is also a latent correctness hole: **transition lane bits are recycled**
 (10 lanes, module-global cursor — notes/research/react-lanes-transitions.md
-§1.2/§3.2). A log entry stores a bare lane number, so an entry from
-transition #1 is indistinguishable from one belonging to transition #11 that
-reused the bit. Benign today only because all pending transition lanes render
-and commit as one batch; wrong the moment React parallelizes transitions.
-Bits are not identities. What the library actually needs are identities.
+§1.2/§3.2; the cursor freezes during async actions, and reuse requires a batch
+to stay pending across ten transition-starting events — realistic when a
+transition suspends on slow data while the user keeps interacting). Examined
+closely, most collisions are *inherited coarsening*: React itself merges the
+two batches, our entries merge identically, and nothing observably diverges
+under today's all-transitions-render-together scheduling. The genuine dangers:
+
+- **The abandonment/resurrection race.** An entry is orphaned (its subtree
+  unmounted, React discarded the queued updates) but not yet swept; the bit is
+  reclaimed by a new transition before the sweep's "lane no longer pending"
+  check runs; the stale entry survives and folds into committed state when the
+  unrelated new batch commits. A dead form's write resurrects seconds later —
+  rare, user-visible, unreproducible.
+- **Async-action edges**: React suspends components on entangled pending-action
+  state; bare lane-tagged entries carry no such guard.
+- **enableParallelTransitions** makes the coarsening argument collapse
+  entirely: independently-scheduled batches must be independently visible, and
+  bits can no longer stand in for identities.
+
+Bits are not identities. What the library actually needs are identities, with
+an explicit retire-exactly-once lifecycle that contract tests can check —
+rather than lifetime bookkeeping that must shadow React's queue lifetimes by
+coincidence.
 
 ### What the library actually needs (semantically)
 
@@ -202,10 +220,26 @@ Costs by path (design constraints for the implementation):
 - **Per commit**: one retirement callback per batch, replacing today's
   per-commit pendingLanesByContainer scan (a small win).
 
+**The observability gate (zero-allocation urgent writes).** A log entry for
+an urgent write only matters if some observer could distinguish worlds. Gate:
+log an entry (and consult the token registry) only when the engine is forked
+OR a render pass is currently pinned. A plain `fooAtom.set(1)` in an event
+handler — no transition pending, no render in flight — therefore allocates
+nothing: compare, store, mark, confirm, setState. Two supporting rules:
+`getCurrentWriteBatch()` returns the token itself (`deferred` is a field on
+it), never a fresh wrapper object; and the documented relaxation is that an
+ungated urgent write is visible to a lower-priority pass starting inside the
+write→commit window (reachable only if the urgent render suspends; identical
+to the existing consumerCount===0 semantics; closable later via a cached
+`hasPendingLowPriorityWork` flag from the patch if ever needed).
+
 Invariants to encode in the contract tests:
 1. Tokens are per-batch, never per-write.
 2. No token is allocated unless a consumer exists AND a write lands in a
-   not-yet-tokened batch.
+   not-yet-tokened batch that the observability gate says must be logged.
 3. A lane slot's generation bump must not release the old token while any
    retained log entry (pinned pass) still references it — the correctness
    rule raw lane numbers silently lack today.
+4. Retirement fires exactly once per token (committed or abandoned), and an
+   abandoned token's entries can never ride a later batch — the
+   resurrection race from §3 must have a dedicated contract test.
