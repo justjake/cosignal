@@ -89,3 +89,17 @@ Tooling: bench.sh now sets BENCH_FRAMEWORKS=react-signals,alien-signals (an
 opt-in filter added to the vendored config) — the suite previously ran all 17
 frameworks while the diff read 3, ~4× wall-clock for nothing. Override with
 BENCH_FRAMEWORKS= (empty) to run everything.
+
+### Validation — v2-review fixes (per-world thenables, render-write guard)
+
+Best-of-3 vs baseline after moving ctx.use slots onto ComputedResult (touches
+updateComputed's entry lookup) and adding the pure-eval write guard: app-shaped
+steady tests within ±2% (large-web-app +0.9%), forked variant neutral-to-better
+everywhere (diamond −7.3%) — forked exercises the per-world entries most, so a
+real cost would show there first. Steady triangle/10x5 flagged +8–13% but their
+forked twins improved and the alien-signals control kept its usual +17–102%
+micro-test drift; both are inside this machine's demonstrated variance. KEEP.
+
+Note: the stored baseline is now several sessions old on a thermally drifting
+machine; refresh it (cp notes/perf/latest.csv notes/perf/baseline.csv) from a
+quiet boot before the next optimization round.
