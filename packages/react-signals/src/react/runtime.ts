@@ -16,6 +16,8 @@ import * as React from 'react';
 import {
   type RenderWorld,
   type BatchRef,
+  isForked,
+  hasActivePins,
   setWriteBatchProvider,
   setAmbientWorld,
   setRenderGuard,
@@ -37,6 +39,7 @@ type PatchedReact = {
   }): () => void;
   unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
   unstable_getCurrentWriteBatch(): BatchRef;
+  unstable_isCurrentWriteDeferred(): boolean;
 };
 
 function patchedReact(): PatchedReact {
@@ -85,6 +88,13 @@ export function ensureInstalled(): void {
 
   setWriteBatchProvider(() => {
     if (consumerCount === 0) return null;
+    // Observability gate, applied BEFORE minting (design-note invariant #2):
+    // an immediate write with no fork pending and no render pass pinned
+    // needs no bookkeeping — classify (side-effect-free) and skip the token
+    // entirely, so plain event-handler writes allocate nothing anywhere.
+    if (!R.unstable_isCurrentWriteDeferred() && !isForked() && !hasActivePins()) {
+      return null;
+    }
     return R.unstable_getCurrentWriteBatch();
   });
 

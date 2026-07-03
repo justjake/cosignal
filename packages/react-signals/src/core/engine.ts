@@ -388,6 +388,11 @@ let minActivePin = Infinity;
 /** Computeds holding a render-pass cache result; swept on last unpin. */
 const passCachedNodes: ComputedNode[] = [];
 
+/** True while any render pass is pinned (provider-side observability gate). */
+export function hasActivePins(): boolean {
+  return activePins.length > 0;
+}
+
 export function pinRenderPass(maxSeq: number): void {
   activePins.push(maxSeq);
   if (maxSeq < minActivePin) minActivePin = maxSeq;

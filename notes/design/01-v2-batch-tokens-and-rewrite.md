@@ -250,7 +250,11 @@ OR a render pass is currently pinned. A plain `fooAtom.set(1)` in an event
 handler — no transition pending, no render in flight — therefore allocates
 nothing: compare, store, mark, confirm, setState. Two supporting rules:
 `getCurrentWriteBatch()` returns the token itself (`deferred` is a field on
-it), never a fresh wrapper object; and the documented relaxation is that an
+it), never a fresh wrapper object; and `unstable_isCurrentWriteDeferred()`
+(pure classification, no minting, no side effects) lets the bindings apply
+the gate BEFORE asking for a token — so gated immediate writes mint nothing
+at all, and invariant 2 below holds strictly (contract-tested: classification
+alone produces no retirement event). The documented relaxation is that an
 ungated urgent write is visible to a lower-priority pass starting inside the
 write→commit window (reachable only if the urgent render suspends; identical
 to the existing consumerCount===0 semantics; closable later via a cached

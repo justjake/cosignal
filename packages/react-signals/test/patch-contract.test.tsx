@@ -25,6 +25,7 @@ import { createRoot, type Root } from 'react-dom/client';
 type Token = { deferred: boolean; id: number };
 type PatchedReact = {
   unstable_getCurrentWriteBatch(): Token;
+  unstable_isCurrentWriteDeferred(): boolean;
   unstable_subscribeToExternalRuntime(listener: {
     onRenderPassStart?: (container: unknown, includedBatches: readonly Token[]) => void;
     onBatchRetired?: (token: Token, committed: boolean) => void;
@@ -106,6 +107,23 @@ describe('batch identity', () => {
       t = R.unstable_getCurrentWriteBatch();
     });
     expect(t.deferred).toBe(false);
+  });
+
+  test('isCurrentWriteDeferred classifies without minting a token', async () => {
+    let inTransition!: boolean;
+    let outside!: boolean;
+    await act(async () => {
+      startTransition(() => {
+        inTransition = R.unstable_isCurrentWriteDeferred();
+      });
+      outside = R.unstable_isCurrentWriteDeferred();
+    });
+    expect(inTransition).toBe(true);
+    expect(outside).toBe(false);
+    // Classification must be pure: no token was minted, so nothing retires —
+    // this is what lets external stores gate before allocating (design-note
+    // invariant #2: no token unless a write actually needs logging).
+    expect(retired).toHaveLength(0);
   });
 });
 
