@@ -177,3 +177,35 @@ chains.
 - Move all lane touching in runtime.ts behind a tiny `BatchAdapter` interface
   — the token API's shape, implemented over lanes — so the engine stops
   seeing lanes even before the patch changes.
+
+## 6. Registry overhead budget
+
+Costs by path (design constraints for the implementation):
+
+- **No React consumers**: zero — the write provider's `consumerCount === 0`
+  gate short-circuits before any registry code, exactly as today.
+- **Per logged write**: one 31-slot array index + generation compare on top of
+  today's lane computation (which React already caches per event). No
+  allocation.
+- **Per batch**: one small token object, minted lazily at the first signal
+  write inside a batch that has none — never at startTransition/event
+  dispatch, never for renders. Transitions without signal writes allocate
+  nothing. Urgent batches: at most one tiny object per event-with-writes
+  (free-listable to zero once retired and unreferenced, if it ever matters).
+- **Per render pass**: one 1–2 element included-tokens collection (linear
+  scan beats a Set at that size), replacing part of the RenderWorld we
+  already allocate.
+- **Per read**: token membership is consulted only on the log-replay slow
+  path (pinned passes / diverged worlds); steady-state reads never see
+  tokens. Identity compare vs today's bitwise AND — nanoseconds on an
+  already-slow path.
+- **Per commit**: one retirement callback per batch, replacing today's
+  per-commit pendingLanesByContainer scan (a small win).
+
+Invariants to encode in the contract tests:
+1. Tokens are per-batch, never per-write.
+2. No token is allocated unless a consumer exists AND a write lands in a
+   not-yet-tokened batch.
+3. A lane slot's generation bump must not release the old token while any
+   retained log entry (pinned pass) still references it — the correctness
+   rule raw lane numbers silently lack today.
