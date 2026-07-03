@@ -146,18 +146,41 @@ onCommit(container): void; // ordering signal for fold timing
 onBatchRetired(token: BatchToken, committed: boolean): void;
 ```
 
-React-side, the patch maintains a small registry mapping (root, lane,
-generation) → token: a token is created when a lane is claimed for an event
-(`requestTransitionLane` / event-priority flush), included-sets are computed
-from render lanes at `prepareFreshStack`, and retirement fires from
-`markRootFinished` (committed) or when a lane leaves `pendingLanes`
-uncommitted (abandoned). All lane lifetime reasoning moves inside
-`vendor/react`, next to the code it depends on — which is where it gets
-maintained when the patch is rebased onto a new React. Userspace log entries
-store a token reference; visibility is `entry.token ∈ pass.includes` or
-"retired-committed before my pin"; folds are driven by explicit retirement
-events. The `pendingLanesByContainer` map and every bitwise operation in
-runtime.ts disappear.
+React-side, the registry is **edge-triggered from the three places React
+already mutates its own books** — never sampled:
+
+1. **Claim** (`requestTransitionLane`'s once-per-event claim): bump the lane
+   slot's generation counter. No allocation; a token is minted lazily only if
+   a signal write later lands in this batch.
+2. **Pending** (`markRootUpdated`, first set of the lane on a root this
+   generation): refcount the roots the batch has work on. One slot check;
+   inert when no token exists.
+3. **Finish** (`markRootFinished`): for each lane leaving `root.pendingLanes`,
+   count down the token's root refcount; emit `onBatchRetired` at zero.
+
+Why this gets abandonment "for free": React itself has no separate
+abandonment mechanism. Updates orphaned by an unmount keep their lane bit
+pending; React eventually schedules that lane, renders nothing, and commits —
+retirement flows through the ordinary commit path. Edge-triggering inherits
+exactly that: claim → retire → claim are strictly ordered synchronous events,
+so a reused bit can never be observed under a stale generation and the
+resurrection race becomes unrepresentable, rather than merely unlikely. (This
+is also why React is immune in the first place: its updates are owned by
+fibers — lifetime is structural, bits never carry identity. A global store
+can't anchor writes to fibers, so the honest substitute is relaying React's
+book mutations at the moment they happen.)
+
+All lane lifetime reasoning moves inside `vendor/react`, next to the code it
+depends on — which is where it gets maintained when the patch is rebased onto
+a new React. Userspace log entries store a token reference; visibility is
+`entry.token ∈ pass.includes` or "retired-committed before my pin"; folds are
+driven by retirement events. The `pendingLanesByContainer` map, the
+abandonment sweep, and every bitwise operation in runtime.ts disappear —
+replaced by nothing, not by equivalent userspace logic. Semantics note: for a
+global store, an orphaned write still folds (the component was only a
+subscriber; head state must converge) — the race was about timing and
+attribution, which edge-triggering eliminates; the retirement event's
+`committed` flag stays available if a drop policy is ever wanted.
 
 A **contract test file** (userspace side, driving the token API through real
 React renders: deferred write → not visible to urgent pass → visible to its
