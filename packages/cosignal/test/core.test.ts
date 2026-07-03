@@ -17,6 +17,8 @@ import {
   retireBatch,
   isForked,
   currentWriteSeq,
+  peekNodeValue,
+  PLANE_COMMITTED,
   type BatchToken,
   type RenderWorld,
 } from '../src/core/engine.ts';
@@ -279,6 +281,32 @@ describe('writes inside computeds', () => {
       configure({ forbidWritesInComputeds: false });
     }
   });
+
+  test('forbidWritesInComputeds also covers pure render-pass evaluation', () => {
+    // The render-world path evaluates computeds without activeSub (it must
+    // not leave links); the write guard has to catch writes there too.
+    configure({ forbidWritesInComputeds: true });
+    try {
+      const other = new Atom({ state: 0 });
+      const c = new Computed({
+        fn: () => {
+          other.set(1);
+          return 1;
+        },
+      });
+      const world: RenderWorld = { includes: [], maxSeq: currentWriteSeq(), seesDeferred: null };
+      pinRenderPass(world.maxSeq);
+      const prev = setAmbientWorld(world);
+      try {
+        expect(() => c.state).toThrow(/forbidden/);
+      } finally {
+        setAmbientWorld(prev);
+        unpinRenderPass(world.maxSeq);
+      }
+    } finally {
+      configure({ forbidWritesInComputeds: false });
+    }
+  });
 });
 
 describe('suspense (ctx.use)', () => {
@@ -291,6 +319,57 @@ describe('suspense (ctx.use)', () => {
     });
     return { promise, resolve, reject };
   }
+
+  test('concurrent worlds keep separate ctx.use thenable slots', async () => {
+    // A computed whose ctx.use input depends on an atom: while a transition
+    // is pending, the COMMITTED and HEAD evaluations use different inputs and
+    // must each hold their own promise — HEAD adopting COMMITTED's pending
+    // thenable (the shared-slot idempotence rule) would deliver "a"'s data
+    // to the "b" world.
+    const q = new Atom({ state: 'a' });
+    const controls = new Map<string, ReturnType<typeof controlled<string>>>();
+    const fetchFor = (key: string): Promise<string> => {
+      let c = controls.get(key);
+      if (c === undefined) {
+        c = controlled<string>();
+        controls.set(key, c);
+      }
+      return c.promise;
+    };
+    const data = new Computed<string>({ fn: (ctx) => ctx.use(fetchFor(q.state)) });
+
+    const capture = (read: () => unknown): PromiseLike<unknown> => {
+      try {
+        read();
+      } catch (e) {
+        if (e instanceof SuspendedRead) return e.thenable;
+        throw e;
+      }
+      throw new Error('expected the read to suspend');
+    };
+
+    const committedThenable = capture(() => data.state);
+    const T_BATCH: BatchToken = { deferred: true };
+    setWriteBatchProvider(() => T_BATCH);
+    try {
+      q.set('b');
+    } finally {
+      setWriteBatchProvider(null);
+    }
+    // Untracked read while forked = HEAD world: must mint its own thenable.
+    const headThenable = capture(() => data.state);
+    expect(headThenable).not.toBe(committedThenable);
+
+    controls.get('a')!.resolve('data:a');
+    await controls.get('a')!.promise;
+    expect(peekNodeValue(data.node, PLANE_COMMITTED)).toBe('data:a');
+
+    controls.get('b')!.resolve('data:b');
+    await controls.get('b')!.promise;
+    expect(data.state).toBe('data:b'); // HEAD read
+    retireBatch(T_BATCH);
+    expect(data.state).toBe('data:b');
+  });
 
   test('pending promise suspends the read; settle self-heals', async () => {
     const { promise, resolve } = controlled<number>();

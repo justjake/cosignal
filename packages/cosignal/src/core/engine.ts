@@ -236,6 +236,12 @@ export type ComputedResult = {
   value: unknown;
   payload: unknown;
   gen: number;
+  /** Positional thenable cache for ctx.use across re-evaluations of THIS
+   * world. Per-world so concurrent worlds never adopt each other's pending
+   * promises (their inputs — and therefore their thenables — can differ). */
+  thenables: unknown[] | null;
+  /** Thenable this world's settle-listener is attached to (dedupe marker). */
+  settleAttached: unknown;
 };
 
 export type ComputedNode = Node & {
@@ -248,10 +254,6 @@ export type ComputedNode = Node & {
   committed: ComputedResult | null;
   fn: (ctx: unknown) => unknown;
   isEqual: (a: unknown, b: unknown) => boolean;
-  /** Positional thenable cache for ctx.use across re-evaluations. */
-  thenables: unknown[] | null;
-  /** Thenable a settle-listener is attached to (dedupe marker). */
-  settleAttached: unknown;
 };
 
 export const WATCHER_EFFECT = 0;
@@ -954,6 +956,17 @@ function updateAtom(atom: AtomNode): boolean {
 let evalThenableIndex = 0;
 let evalThenables: unknown[] | null = null;
 
+/**
+ * The computed currently in a PURE render-pass evaluation
+ * (resolveComputedInWorld). Pure evaluations run without activeSub — they
+ * must not create links — so write-time checks that key off activeSub
+ * (forbidWritesInComputeds) consult this instead. Cycle detection cannot:
+ * it needs the links a pure evaluation deliberately doesn't leave, so a
+ * self-feeding write in a render evaluation surfaces as an urgent re-render
+ * caught by React's own update-loop protection rather than a CycleError.
+ */
+let pureEvalComputed: ComputedNode | null = null;
+
 // ---------------------------------------------------------------------------
 // Computed results (world-keyed cache)
 // ---------------------------------------------------------------------------
@@ -971,17 +984,40 @@ function planeWorld(plane: Plane): object {
   return plane === PLANE_HEAD && forkCount > 0 ? WORLD_HEAD : WORLD_COMMITTED;
 }
 
+/** A fresh result entry for `world`, registered on the computed. */
+function createResult(c: ComputedNode, world: object): ComputedResult {
+  const entry: ComputedResult = {
+    world,
+    status: STATUS_VALUE,
+    value: undefined,
+    payload: undefined,
+    gen: forkGen,
+    thenables: null,
+    settleAttached: null,
+  };
+  c.results.push(entry);
+  if (world === WORLD_COMMITTED) c.committed = entry;
+  return entry;
+}
+
 /**
  * Re-evaluates a computed in `plane`. Returns whether its observable result
  * (value, error, or suspension) changed. Never throws — except CycleError,
  * which is a programming error that must fail loudly at the offending site.
  */
 function updateComputed(c: ComputedNode, plane: Plane): boolean {
+  // Locate (or create) this world's entry up front: the evaluation's ctx.use
+  // slots live on it, so concurrent worlds keep separate positional caches.
+  // A fresh entry is invisible mid-evaluation — reading `c` during its own
+  // run throws CycleError before any cache lookup.
+  const world = planeWorld(plane);
+  const found = findResult(c, world);
+  const entry = found ?? createResult(c, world);
   const frame = startTracking(c, plane);
   const prevThenables = evalThenables;
   const prevThenableIndex = evalThenableIndex;
-  if (c.thenables === null) c.thenables = [];
-  evalThenables = c.thenables;
+  if (entry.thenables === null) entry.thenables = [];
+  evalThenables = entry.thenables;
   evalThenableIndex = 0;
   ++evalDepth;
   ++batchDepth; // defer notification delivery for writes inside the getter
@@ -1011,8 +1047,8 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
       payload = e;
     }
   } finally {
-    if (c.thenables !== null && evalThenableIndex < c.thenables.length) {
-      c.thenables.length = evalThenableIndex; // drop unused thenable slots
+    if (entry.thenables !== null && evalThenableIndex < entry.thenables.length) {
+      entry.thenables.length = evalThenableIndex; // drop unused thenable slots
     }
     evalThenables = prevThenables;
     evalThenableIndex = prevThenableIndex;
@@ -1022,15 +1058,13 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
     if (tracer !== null) setCurrentCause(traceCause);
   }
 
-  const world = planeWorld(plane);
-  let entry = findResult(c, world);
   let changed: boolean;
   try {
     // Note: entry.gen is deliberately NOT part of change detection — gen
     // governs seeding trust (ensureHeadResult), and a stale-generation entry
     // holding an equal value is still a legitimate equality cutoff.
     changed =
-      entry === null ||
+      found === null ||
       entry.status !== status ||
       (status === STATUS_VALUE ? !c.isEqual(entry.value, value) : entry.payload !== payload);
   } catch (compareError) {
@@ -1042,18 +1076,14 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
     c.flags |= dirtyBit(plane);
     changed = true;
   }
-  if (entry === null) {
-    entry = { world, status, value, payload, gen: forkGen };
-    c.results.push(entry);
-    if (world === WORLD_COMMITTED) c.committed = entry;
-  } else {
-    entry.status = status;
-    entry.value = value;
-    entry.payload = payload;
-    entry.gen = forkGen;
-  }
+  entry.status = status;
+  entry.value = value;
+  entry.payload = payload;
+  entry.gen = forkGen;
   c.flags |= F.Mutable;
-  if (status === STATUS_SUSPENDED) attachSettleListener(c, payload as InstrumentedThenable, plane);
+  if (status === STATUS_SUSPENDED) {
+    attachSettleListener(c, entry, payload as InstrumentedThenable, plane);
+  }
   if (cycleError !== null) throw cycleError;
   return changed;
 }
@@ -1069,21 +1099,13 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
 function ensureHeadResult(c: ComputedNode, head: ComputedResult | null): ComputedResult | null {
   const committed = findResult(c, WORLD_COMMITTED);
   if (committed !== null && committed.gen !== forkGen) {
-    if (head === null) {
-      head = {
-        world: WORLD_HEAD,
-        status: committed.status,
-        value: committed.value,
-        payload: committed.payload,
-        gen: forkGen,
-      };
-      c.results.push(head);
-    } else {
-      head.status = committed.status;
-      head.value = committed.value;
-      head.payload = committed.payload;
-      head.gen = forkGen;
-    }
+    if (head === null) head = createResult(c, WORLD_HEAD);
+    // Seed the result, not the ctx.use slots: thenable caches are per-world
+    // (a head evaluation with different inputs must mint its own promises).
+    head.status = committed.status;
+    head.value = committed.value;
+    head.payload = committed.payload;
+    head.gen = forkGen;
     return head;
   }
   return null;
@@ -1095,12 +1117,19 @@ function ensureHeadResult(c: ComputedNode, head: ComputedResult | null): Compute
  * re-run. Subscriptions are not marked — for renders, React's own ping (via
  * use()) re-renders the components that suspended.
  */
-function attachSettleListener(c: ComputedNode, thenable: InstrumentedThenable, plane: Plane): void {
-  if (c.settleAttached === thenable) return;
-  c.settleAttached = thenable;
+function attachSettleListener(
+  c: ComputedNode,
+  attachedTo: ComputedResult,
+  thenable: InstrumentedThenable,
+  plane: Plane,
+): void {
+  if (attachedTo.settleAttached === thenable) return;
+  attachedTo.settleAttached = thenable;
   const onSettle = (): void => {
-    if (c.settleAttached !== thenable) return;
-    c.settleAttached = null;
+    if (attachedTo.settleAttached !== thenable) return;
+    attachedTo.settleAttached = null;
+    // Re-resolve the world's live entry: the fork may have ended (or begun)
+    // since attach, remapping this plane to a different world key.
     const entry = findResult(c, planeWorld(plane));
     if (entry === null || entry.status !== STATUS_SUSPENDED || entry.payload !== thenable) return;
     if (tracer !== null) tracer.emit('settle', currentCause, c);
@@ -1343,14 +1372,30 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
   if ((c.flags & F.RecursedCheck) !== 0) {
     throw new CycleError('Computed read during its own evaluation (dependency cycle).');
   }
+  // Register for the pass-end sweep before creating this pass's entry (the
+  // scan below must not see the entry it is deciding about).
+  let hadPassEntry = false;
+  const results = c.results;
+  for (let i = 0; i < results.length; i++) {
+    if (isPassWorld(results[i]!.world)) {
+      hadPassEntry = true;
+      break;
+    }
+  }
+  if (!hadPassEntry) passCachedNodes.push(c);
+  // The pass entry is created up front so its ctx.use slots are this world's
+  // own (see ComputedResult.thenables); it dies with the pass at last unpin.
+  const entry = createResult(c, world);
   let status = STATUS_VALUE;
   let value: unknown = undefined;
   let payload: unknown = undefined;
   const prevThenables = evalThenables;
   const prevIndex = evalThenableIndex;
-  if (c.thenables === null) c.thenables = [];
-  evalThenables = c.thenables;
+  entry.thenables = [];
+  evalThenables = entry.thenables;
   evalThenableIndex = 0;
+  const prevPureEval = pureEvalComputed;
+  pureEvalComputed = c;
   c.flags |= F.RecursedCheck;
   ++evalDepth;
   try {
@@ -1368,20 +1413,13 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
   } finally {
     c.flags &= ~F.RecursedCheck;
     --evalDepth;
+    pureEvalComputed = prevPureEval;
     evalThenables = prevThenables;
     evalThenableIndex = prevIndex;
   }
-  let hadPassEntry = false;
-  const results = c.results;
-  for (let i = 0; i < results.length; i++) {
-    if (isPassWorld(results[i]!.world)) {
-      hadPassEntry = true;
-      break;
-    }
-  }
-  if (!hadPassEntry) passCachedNodes.push(c);
-  const entry: ComputedResult = { world, status, value, payload, gen: forkGen };
-  results.push(entry);
+  entry.status = status;
+  entry.value = value;
+  entry.payload = payload;
   if (tracer !== null) tracer.emit('render-read', currentCause, c, { pinned: true, status });
   return unwrapEntry(entry);
 }
@@ -1482,9 +1520,10 @@ function writeAtomImpl(
 ): void {
   if (
     config.forbidWritesInComputeds &&
-    activeSub !== undefined &&
-    activeSub.kind === KIND_COMPUTED &&
-    (activeSub.flags & F.RecursedCheck) !== 0
+    (pureEvalComputed !== null ||
+      (activeSub !== undefined &&
+        activeSub.kind === KIND_COMPUTED &&
+        (activeSub.flags & F.RecursedCheck) !== 0))
   ) {
     throw new Error(
       'Writing to an atom inside a computed is forbidden (forbidWritesInComputeds).',
@@ -1864,7 +1903,5 @@ export function createComputedNode(
     committed: null,
     fn,
     isEqual: isEqual ?? Object.is,
-    thenables: null,
-    settleAttached: null,
   };
 }
