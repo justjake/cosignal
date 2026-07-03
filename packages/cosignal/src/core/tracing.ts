@@ -27,8 +27,11 @@ export type TraceEvent = {
   type: TraceEventType;
   /** Millisecond timestamp assigned by the tracer. */
   time: number;
-  /** The node the event concerns, when applicable. */
+  /** The node the event concerns, when applicable. The tracer retains nodes
+   * only weakly, so this is absent once the node has been collected. */
   node?: unknown;
+  /** The node's debug label, snapshotted at emit time (survives collection). */
+  nodeLabel?: string;
   /** Free-form details; shape depends on `type`. Documented in src/tracing. */
   data?: unknown;
 };

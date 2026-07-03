@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { Atom, Computed, effect } from '../src/core/index.ts';
-import { enableTracing, type TracingSession } from '../src/tracing/index.ts';
+import { enableTracing, toChromeTrace, type TracingSession } from '../src/tracing/index.ts';
 
 let session: TracingSession | null = null;
 afterEach(() => {
@@ -61,5 +61,40 @@ describe('tracing', () => {
     for (let i = 1; i <= 10; i++) a.set(i);
     expect(seen.length).toBeGreaterThanOrEqual(10);
     expect(session.events().length).toBeLessThanOrEqual(4);
+  });
+
+  test('events carry the node (weakly) and a label snapshot', () => {
+    session = enableTracing();
+    const a = new Atom({ state: 1, label: 'count' });
+    session.clear();
+    a.set(2);
+    const write = session.events().find((e) => e.type === 'atom-write')!;
+    // While the node is alive, both the reference and the snapshot are there.
+    // (After collection only nodeLabel survives — not testable without
+    // forcing GC, but the materialization path is the same.)
+    expect(write.node).toBe(a.node);
+    expect(write.nodeLabel).toBe('count');
+  });
+
+  test('toChromeTrace produces trace-event JSON', () => {
+    session = enableTracing();
+    const a = new Atom({ state: 1, label: 'count' });
+    const c = new Computed({ fn: () => a.state * 2, label: 'double' });
+    const dispose = effect(() => {
+      void c.state;
+    });
+    session.clear();
+    a.set(2);
+    const trace = toChromeTrace(session.events());
+    expect(trace.displayTimeUnit).toBe('ms');
+    expect(trace.traceEvents.length).toBe(session.events().length);
+    const write = trace.traceEvents.find((e) => e.name === 'atom-write count')!;
+    expect(write.ph).toBe('X');
+    expect(write.cat).toBe('cosignal');
+    expect(typeof write.ts).toBe('number');
+    expect(write.args.type).toBe('atom-write');
+    // Round-trips through JSON (the file you load into chrome://tracing).
+    expect(() => JSON.stringify(trace)).not.toThrow();
+    dispose();
   });
 });

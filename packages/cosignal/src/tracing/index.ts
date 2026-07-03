@@ -56,31 +56,59 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
   active = true;
 
   // Ring buffer: `start` indexes the oldest retained event; eviction is an
-  // overwrite + pointer bump, never an array shift.
+  // overwrite + pointer bump, never an array shift. Stored events hold their
+  // node through a WeakRef so a long-lived session never pins disposed
+  // graphs; the label is snapshotted at emit time so displays survive
+  // collection.
   const capacity = options.bufferSize ?? 10_000;
-  const buffer: (TraceEvent | undefined)[] = [];
+  type StoredEvent = {
+    id: number;
+    cause: number;
+    type: TraceEventType;
+    time: number;
+    nodeRef: WeakRef<object> | null;
+    nodeLabel: string | undefined;
+    data: unknown;
+  };
+  const buffer: (StoredEvent | undefined)[] = [];
   let start = 0;
   let size = 0;
   let dropped = 0;
-  const byId = new Map<number, TraceEvent>();
+  const byId = new Map<number, StoredEvent>();
   const listeners = new Set<(event: TraceEvent) => void>();
   let nextId = 1;
 
+  function storedNode(e: StoredEvent): unknown {
+    return e.nodeRef !== null ? e.nodeRef.deref() : undefined;
+  }
+
+  /** The public view of a stored event (node re-materialized via WeakRef). */
+  function toPublic(e: StoredEvent): TraceEvent {
+    const out: TraceEvent = { id: e.id, cause: e.cause, type: e.type, time: e.time };
+    const node = storedNode(e);
+    if (node !== undefined) out.node = node;
+    if (e.nodeLabel !== undefined) out.nodeLabel = e.nodeLabel;
+    if (e.data !== undefined) out.data = e.data;
+    return out;
+  }
+
   /** Retained events, oldest first. */
-  function retained(): TraceEvent[] {
-    const out: TraceEvent[] = new Array(size);
+  function retained(): StoredEvent[] {
+    const out: StoredEvent[] = new Array(size);
     for (let i = 0; i < size; i++) out[i] = buffer[(start + i) % capacity]!;
     return out;
   }
 
   setTracer({
     emit(type, cause, node, data): number {
-      const event: TraceEvent = {
+      const label = (node as { label?: string | null } | undefined)?.label;
+      const event: StoredEvent = {
         id: nextId++,
         cause,
         type,
         time: performance.now(),
-        node,
+        nodeRef: typeof node === 'object' && node !== null ? new WeakRef(node) : null,
+        nodeLabel: typeof label === 'string' ? label : undefined,
         data,
       };
       if (size < capacity) {
@@ -93,7 +121,10 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
         start = (start + 1) % capacity;
       }
       byId.set(event.id, event);
-      for (const listener of listeners) listener(event);
+      if (listeners.size > 0) {
+        const pub = toPublic(event);
+        for (const listener of listeners) listener(pub);
+      }
       return event.id;
     },
   });
@@ -104,11 +135,13 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
   }
 
   function causeChain(event: TraceEvent): TraceEvent[] {
-    const chain: TraceEvent[] = [];
-    let current: TraceEvent | undefined = event;
-    while (current !== undefined) {
-      chain.unshift(current);
-      current = current.cause !== 0 ? byId.get(current.cause) : undefined;
+    const chain: TraceEvent[] = [event];
+    let cause = event.cause;
+    while (cause !== 0) {
+      const stored = byId.get(cause);
+      if (stored === undefined) break;
+      chain.unshift(toPublic(stored));
+      cause = stored.cause;
     }
     return chain;
   }
@@ -120,7 +153,7 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
       listeners.clear();
     },
     events() {
-      return retained();
+      return retained().map(toPublic);
     },
     clear() {
       buffer.length = 0;
@@ -136,7 +169,9 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
     causeChain,
     eventsFor(signal) {
       const node = nodeOf(signal);
-      return retained().filter((e) => e.node === node);
+      return retained()
+        .filter((e) => storedNode(e) === node)
+        .map(toPublic);
     },
     countsFor(signal) {
       const node = nodeOf(signal);
@@ -144,7 +179,7 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
       let notifies = 0;
       let writes = 0;
       for (const e of retained()) {
-        if (e.node !== node) continue;
+        if (storedNode(e) !== node) continue;
         if (e.type === 'computed-eval' || e.type === 'effect-run') evals++;
         else if (e.type === 'notify') notifies++;
         else if (e.type === 'atom-write') writes++;
@@ -163,4 +198,47 @@ export function enableTracing(options: TracingOptions = {}): TracingSession {
     },
   };
   return session;
+}
+
+// ---------------------------------------------------------------------------
+// Chrome trace export
+// ---------------------------------------------------------------------------
+
+/** One event in Chrome's trace-event format (ph "X": complete event). */
+export type ChromeTraceEvent = {
+  name: string;
+  cat: string;
+  ph: 'X';
+  /** Microseconds. */
+  ts: number;
+  dur: number;
+  pid: number;
+  tid: number;
+  args: Record<string, unknown>;
+};
+
+export type ChromeTraceExport = {
+  traceEvents: ChromeTraceEvent[];
+  displayTimeUnit: 'ms';
+};
+
+/**
+ * Converts trace events (from `session.events()`) to Chrome's trace-event
+ * JSON format. Write `JSON.stringify(toChromeTrace(session.events()))` to a
+ * file and load it in chrome://tracing or https://ui.perfetto.dev to see the
+ * session on a zoomable timeline. Our events are instants, so each renders
+ * as a zero-duration slice; causality ids ride along in `args`.
+ */
+export function toChromeTrace(events: readonly TraceEvent[]): ChromeTraceExport {
+  const traceEvents: ChromeTraceEvent[] = events.map((e) => ({
+    name: e.nodeLabel !== undefined ? `${e.type} ${e.nodeLabel}` : e.type,
+    cat: 'cosignal',
+    ph: 'X' as const,
+    ts: Math.round(e.time * 1000), // ms → µs
+    dur: 0,
+    pid: 1,
+    tid: 1,
+    args: { id: e.id, cause: e.cause, type: e.type, node: e.nodeLabel },
+  }));
+  return { traceEvents, displayTimeUnit: 'ms' };
 }

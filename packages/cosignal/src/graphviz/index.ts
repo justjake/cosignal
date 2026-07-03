@@ -282,7 +282,14 @@ export function traceToDot(
 
   for (const e of events) {
     if (!included(e)) continue;
-    const subject = nodeDisplayName(e.node as Node | undefined);
+    // The tracer holds nodes weakly; fall back to the emit-time label
+    // snapshot once a node has been collected.
+    const subject =
+      e.node !== undefined
+        ? nodeDisplayName(e.node as Node)
+        : e.nodeLabel !== undefined
+          ? `${e.nodeLabel} (collected)`
+          : '';
     const label = subject !== '' ? `#${e.id} ${e.type}\n${subject}` : `#${e.id} ${e.type}`;
     const color = EVENT_COLORS[e.type] ?? '#f3f4f6';
     lines.push(`  e${e.id} [label="${q(label)}", fillcolor="${color}"];`);
