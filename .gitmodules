@@ -3,10 +3,10 @@
 	url = https://github.com/justjake/react.git
 [submodule "vendor/alien-signals"]
 	path = vendor/alien-signals
-	url = https://github.com/stackblitz/alien-signals
+	url = https://github.com/justjake/alien-signals.git
 [submodule "vendor/react-concurrent-store"]
 	path = vendor/react-concurrent-store
-	url = https://github.com/thejustinwalsh/react-concurrent-store
+	url = https://github.com/justjake/react-concurrent-store.git
 [submodule "vendor/js-reactivity-benchmark"]
 	path = vendor/js-reactivity-benchmark
-	url = https://github.com/transitive-bullshit/js-reactivity-benchmark
+	url = https://github.com/justjake/js-reactivity-benchmark.git
