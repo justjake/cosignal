@@ -29,7 +29,6 @@ type PatchedReact = {
   unstable_subscribeToExternalRuntime(listener: {
     onRenderPassStart?: (container: unknown, includedBatches: readonly Token[]) => void;
     onBatchRetired?: (token: Token, committed: boolean) => void;
-    onCommit?: (container: unknown) => void;
   }): () => void;
 };
 const R = React as unknown as PatchedReact;

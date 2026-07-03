@@ -140,9 +140,7 @@ unstable_getCurrentWriteBatch(): { token: BatchToken; deferred: boolean };
 onRenderPassStart(container, includes: ReadonlySet<BatchToken>): void;
 onRenderPassEnd(container): void;
 
-// Retirement (replaces onCommit's committedLanes/remainingLanes and the
-// userspace abandonment sweep):
-onCommit(container): void; // ordering signal for fold timing
+// Retirement (replaces onCommit and the userspace abandonment sweep):
 onBatchRetired(token: BatchToken, committed: boolean): void;
 ```
 

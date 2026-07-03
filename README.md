@@ -6,11 +6,17 @@ a minimal patch to React that exposes the render/commit lifecycle to external
 state libraries.
 
 ```tsx
-import { Atom, Computed, useSignal, useComputed, useSignalEffect } from 'cosignal';
+import {
+  Atom,
+  Computed,
+  useSignal,
+  useComputed,
+  useSignalEffect,
+} from "cosignal";
 
 const count = new Atom({
   state: 0,
-  label: 'count',
+  label: "count",
   // Runs when the atom becomes observed; cleanup when it no longer is.
   effect: (ctx) => {
     const ws = subscribeRemote((v) => ctx.set(v));
@@ -18,7 +24,7 @@ const count = new Atom({
   },
 });
 
-const promise = fetch('/api/factor').then((r) => r.json());
+const promise = fetch("/api/factor").then((r) => r.json());
 
 const scaled = new Computed({
   // ctx.use reads a promise inside a computed: fulfilled → value,
@@ -28,11 +34,14 @@ const scaled = new Computed({
 
 function MyComponent(props: { other: number }) {
   const value = useSignal(scaled);
-  const [s, setS] = useState('something');
+  const [s, setS] = useState("something");
 
   // Like useMemo, but re-renders when a referenced signal changes.
   // Closed-over props/state go in deps; signal reads are auto-tracked.
-  const other = useComputed(() => count.state + s + value + props.other, [s, value, props.other]);
+  const other = useComputed(
+    () => count.state + s + value + props.other,
+    [s, value, props.other],
+  );
 
   // Like useEffect, but also re-runs when a referenced signal's
   // committed value changes.
@@ -48,22 +57,22 @@ Writes go through `set` and `update`, and compose with React exactly like
 `setState` — including functional-update rebasing:
 
 ```tsx
-count.set(5);                  // replace
-count.update((x) => x + 1);    // functional update: stored and REPLAYED per
-                               // world, like a queued setState(fn) — an urgent
-                               // update interleaving a pending transition
-                               // applies to committed state now and re-applies
-                               // on top of the transition when it commits.
+count.set(5); // replace
+count.update((x) => x + 1); // functional update: stored and REPLAYED per
+// world, like a queued setState(fn) — an urgent
+// update interleaving a pending transition
+// applies to committed state now and re-applies
+// on top of the transition when it commits.
 
 startTransition(() => {
-  count.set(5);           // rides the transition
-  setTab('details');      // same lane — both commit in the same frame
+  count.set(5); // rides the transition
+  setTab("details"); // same lane — both commit in the same frame
 });
 
 // Or, equivalently, with write coalescing (one notification per subscriber):
 startSignalTransition(() => {
   count.set(5);
-  setTab('details');
+  setTab("details");
 });
 ```
 
@@ -83,15 +92,15 @@ rebase cleanly. See `DESIGN.md` for how (and for why
 
 ## What's here
 
-| Path | What |
-|---|---|
-| `packages/cosignal/src/core` | Framework-agnostic reactive graph: alien-signals-derived push-pull propagation, plus a two-plane "world" model that keeps committed and pending-transition state consistent under concurrent rendering. Zero React imports. |
-| `packages/cosignal/src/react` | `useSignal` / `useComputed` / `useSignalEffect`, the runtime that binds React's lifecycle events to the engine's worlds, and `getInstrumentedReact` (typed access to the instrumented build's add-on surface, e.g. for a MutationObserver that ignores React's own commits). |
-| `packages/cosignal/src/tracing` | Lazy-loadable causality tracing: every write/eval/notify/effect event carries its cause, answering "why did my computed re-run". Zero overhead unless imported. |
-| `packages/cosignal/src/graphviz` | Debug visualizers that emit Graphviz DOT: `dependencyGraphToDot(signals)` snapshots the live graph (per-plane values and edges while a transition is pending); `traceToDot(events)` renders a tracing session's cause chains. Loads independently of the tracing recorder. Give signals a `name` option for readable labels. |
-| `vendor/react` (branch `react-signals-patch`) | The React patch: an external-runtime introspection channel (render-pass + commit lifecycle, DOM-mutation bracket, update-lane attribution). ~2 new files, 5 hook points, no Fiber shapes exposed. |
-| `vendor/js-reactivity-benchmark` (branch `cosignal`) | Benchmark adapter for the core graph (`testPullCounts: true`). |
-| `DESIGN.md`, `notes/` | Architecture and the research it rests on (file:line references into React and alien-signals). |
+| Path                                                 | What                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/cosignal/src/core`                         | Framework-agnostic reactive graph: alien-signals-derived push-pull propagation, plus a two-plane "world" model that keeps committed and pending-transition state consistent under concurrent rendering. Zero React imports.                                                                                                  |
+| `packages/cosignal/src/react`                        | `useSignal` / `useComputed` / `useSignalEffect`, the runtime that binds React's lifecycle events to the engine's worlds, and `getInstrumentedReact` (typed access to the instrumented build's add-on surface, e.g. for a MutationObserver that ignores React's own commits).                                                 |
+| `packages/cosignal/src/tracing`                      | Lazy-loadable causality tracing: every write/eval/notify/effect event carries its cause, answering "why did my computed re-run". Zero overhead unless imported.                                                                                                                                                              |
+| `packages/cosignal/src/graphviz`                     | Debug visualizers that emit Graphviz DOT: `dependencyGraphToDot(signals)` snapshots the live graph (per-plane values and edges while a transition is pending); `traceToDot(events)` renders a tracing session's cause chains. Loads independently of the tracing recorder. Give signals a `name` option for readable labels. |
+| `vendor/react` (branch `react-signals-patch`)        | The React patch: an external-runtime introspection channel (render-pass + commit lifecycle, DOM-mutation bracket, update-lane attribution). ~2 new files, 5 hook points, no Fiber shapes exposed.                                                                                                                            |
+| `vendor/js-reactivity-benchmark` (branch `cosignal`) | Benchmark adapter for the core graph (`testPullCounts: true`).                                                                                                                                                                                                                                                               |
+| `DESIGN.md`, `notes/`                                | Architecture and the research it rests on (file:line references into React and alien-signals).                                                                                                                                                                                                                               |
 
 ## Setup
 

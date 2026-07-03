@@ -346,7 +346,7 @@ Queries:
 - `getCurrentWriteBatch()` — the token for the batch a write issued right now
   belongs to (minted lazily, stable for the batch's life). Stamped on write-
   log entries.
-- `getRenderContext()` — `null` outside render; `{container, renderLanes}`
+- `getRenderContext()` — `null` outside render; `{container}`
   during render. Drives the read rule and "inside render" detection.
 
 ### 6.2 DOM mutation window

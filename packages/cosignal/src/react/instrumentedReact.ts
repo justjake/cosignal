@@ -20,16 +20,13 @@ export type { BatchToken };
 export type InstrumentedReactListener = {
   /** A render pass began on `container`; `includedBatches` are the tokens of
    * every live batch the pass renders. Passes span yields; a pass ends by
-   * completing or restarting. `renderLanes` is diagnostic only. */
+   * completing or restarting. */
   onRenderPassStart?: (
     container: unknown,
     includedBatches: readonly BatchToken[],
-    renderLanes: number,
   ) => void;
   /** The render pass on `container` completed or was discarded. */
   onRenderPassEnd?: (container: unknown) => void;
-  /** A commit's host-tree mutations finished; the committed tree is current. */
-  onCommit?: (container: unknown, committedLanes: number, remainingLanes: number) => void;
   /** React is about to mutate the host tree under `container`. Fires only
    * when there are mutations to apply. */
   onBeforeMutation?: (container: unknown) => void;
@@ -43,7 +40,7 @@ export type InstrumentedReactListener = {
 export type InstrumentedReact = {
   unstable_subscribeToExternalRuntime(listener: InstrumentedReactListener): () => void;
   /** Non-null while React is rendering on the current thread. */
-  unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
+  unstable_getRenderContext(): null | { container: unknown };
   /** Token identifying the batch a write issued right now belongs to
    * (minted lazily; stable for the batch's life). */
   unstable_getCurrentWriteBatch(): BatchToken;

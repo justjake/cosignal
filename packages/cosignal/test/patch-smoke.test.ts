@@ -47,16 +47,16 @@ test('external runtime batch tokens + lifecycle events', async () => {
 
   const el = document.createElement('div');
   const root = createRoot(el);
-  let sawRenderContext = false;
+  let renderContext: unknown = null;
   function App() {
-    sawRenderContext = R.unstable_getRenderContext() !== null;
+    renderContext = R.unstable_getRenderContext();
     return React.createElement('span', null, 'hi');
   }
   await act(async () => {
     root.render(React.createElement(App));
   });
   expect(el.textContent).toBe('hi');
-  expect(sawRenderContext).toBe(true);
+  expect(renderContext).toEqual({ container: el });
   expect(R.unstable_getRenderContext()).toBeNull(); // only during render
   expect(events.some((e) => e.startsWith('start:'))).toBe(true);
   expect(events).toContain('end');
