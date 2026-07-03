@@ -55,16 +55,21 @@ subscriber). Each atom holds:
 - a committed value — the value every React tree that has finished committing
   agrees on;
 - a small **write log**: a list of recent writes, created only while React
-  bindings are active. Think of it as a receipt tape. Each entry records:
-  - the written `value`;
-  - the `lane` React assigned to the write (which "priority channel" the
-    write's re-renders ride on — a transition lane, the urgent/sync lane,
-    and so on);
+  bindings are active (and, for immediate writes, only while something could
+  observe the difference — see "the observability gate" in the v2 note).
+  Think of it as a receipt tape. Each entry records:
+  - the written `value`, or for `update()`/`dispatch()` the update *function*
+    (stored, not evaluated — replayed per world for React-style rebasing);
+  - the `batch` — an opaque token from the React patch identifying the update
+    batch this write belongs to (all writes in one event or transition share
+    one token; `deferred` marks transition-like batches). Tokens replace raw
+    lane bits: they are identities that can never alias when React recycles
+    lane bits (notes/design/01-v2-batch-tokens-and-rewrite.md);
   - `seq` — a ticket number from a global take-a-number counter, so every
     write in the whole program has a position in one shared timeline;
-  - `foldedAtSeq` — zero while the write is still pending, and stamped with a
-    fresh ticket number at the moment the write becomes part of committed
-    state (when React commits it, see "Folding" below).
+  - `retiredAtSeq` — zero while the batch is pending, and stamped with a
+    fresh ticket at the moment the batch retires (React commits it — or
+    prunes it; see "Folding" below).
 
 Fast path: when no transition or concurrent work is pending, the log is empty
 and an atom is just its value — pure-core users (and the benchmark) never pay
@@ -81,11 +86,11 @@ Every read resolves against a **read context**:
   the current ticket number — the pass's **pin**. For the rest of that pass
   (even if React pauses it and resumes later), an atom read returns the value
   of the newest log entry that passes either test:
-  1. **It already committed, before this pass started.** (Its `foldedAtSeq`
-     stamp is at or below the pin.)
-  2. **This render is rendering its lane, and the write existed when the pass
-     started.** (Its lane is one of the render's lanes, and its `seq` ticket
-     is at or below the pin.)
+  1. **Its batch already retired, before this pass started.** (Its
+     `retiredAtSeq` stamp is at or below the pin.)
+  2. **This render includes its batch, and the write existed when the pass
+     started.** (Its token is in the pass's included-batches set, and its
+     `seq` ticket is at or below the pin.)
 
   If no entry qualifies, the read falls back to the value from before the
   oldest retained entry.

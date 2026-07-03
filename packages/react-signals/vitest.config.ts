@@ -7,6 +7,7 @@ export default defineConfig({
       ['test/react*.test.tsx', 'jsdom'],
       ['test/mutation-observer.test.tsx', 'jsdom'],
       ['test/patch-smoke.test.ts', 'jsdom'],
+      ['test/patch-contract.test.tsx', 'jsdom'],
       ['test/**', 'node'],
     ],
   },

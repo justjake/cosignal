@@ -82,3 +82,39 @@ hub-shaped graph hits different branch patterns; correctness checks pass in
 both modes. Since forked mode only exists between a transition write and its
 commit (typically a few frames), the steady-state numbers are the ones that
 describe an app at rest.
+
+## v2 engine (log-first, batch tokens) — 2026-07-02, best-of-3
+
+After the v2 rewrite (opaque batch tokens replacing lanes; log-as-truth with
+world-keyed computed results; observability gate) plus the committed-entry
+hot-pointer optimization (notes/perf/experiments.md, experiment A). Same
+machine; best-of-3 via scripts/perf/bench.sh. All 102 tests + 7 patch
+contract tests green; conformance 119/119 with exact pull counts.
+
+| test | v2 steady | v2 forked | alien-signals (same runs) |
+|---|---:|---:|---:|
+| avoidablePropagation | 198.95 | 223.55 | 149.54 |
+| broadPropagation | 172.66 | 243.42 | 106.91 |
+| deepPropagation | 80.47 | 175.23 | 45.70 |
+| diamond | 172.19 | 322.30 | 129.80 |
+| triangle | 51.04 | 108.14 | 42.59 |
+| molBench | 270.52 | 273.39 | 258.49 |
+| 10x5 simple component | 137.82 | 187.87 | 95.04 |
+| 1000x12 large web app | 320.70 | 365.81 | 186.08 |
+| 1000x5 wide dense | 421.33 | 504.07 | 293.94 |
+| 5x500 deep | 120.86 | 137.98 | 84.19 |
+
+vs v1 (single-run numbers above): v2 steady is faster on most benches
+(broad 173 vs 179, triangle 51 vs 57, wide-dense 421 vs 453, simple 138 vs
+162, dynamic-component 144 vs 160) and within a few percent elsewhere —
+i.e., the rewrite that deleted the plane-mirror bookkeeping also did not
+cost performance once the hot-pointer landed. Forked overhead is now
++13–35% on app-shaped benches (large-web-app +14%, wide-dense +20%) —
+better than v1's forked variant on the scale benches.
+
+Allocation profile (sampling heap profiler, 10s runs): steady write→compute→
+effect cycles and event-handler set() calls with live subscriptions both show
+ZERO engine allocations — every sampled byte belongs to Node module
+bootstrap. The observability gate's zero-alloc guarantee holds in practice,
+and V8 scalar-replaces the tracking frames (see experiments.md
+"Non-experiments").

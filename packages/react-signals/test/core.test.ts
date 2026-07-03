@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from 'vitest';
+import { beforeEach, describe, expect, test } from 'vitest';
 import {
   Atom,
   Computed,
@@ -10,13 +10,14 @@ import {
   CycleError,
 } from '../src/core/index.ts';
 import {
-  setWriteLaneProvider,
+  setWriteBatchProvider,
   setAmbientWorld,
   pinRenderPass,
   unpinRenderPass,
-  fold,
+  retireBatch,
   isForked,
   currentWriteSeq,
+  type BatchRef,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
@@ -382,25 +383,25 @@ describe('atom observed lifecycle', () => {
   });
 });
 
-describe('worlds (transition writes, folds, render passes)', () => {
-  const LANE_SYNC = 1;
-  const LANE_T = 2;
+describe('worlds (deferred writes, retirement, render passes)', () => {
+  // Fake batch tokens standing in for the patch's (opaque BatchRef objects).
+  let SYNC_BATCH: BatchRef;
+  let T_BATCH: BatchRef;
+  beforeEach(() => {
+    SYNC_BATCH = { deferred: false };
+    T_BATCH = { deferred: true };
+  });
 
-  function makeWorld(lanes: number, maxSeq: number): RenderWorld {
-    return {
-      lanes,
-      maxSeq,
-      laneIncluded: (worldLanes, lane) => (worldLanes & lane) !== 0,
-      seesTransitions: null,
-    };
+  function makeWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
+    return { includes, maxSeq, seesDeferred: null };
   }
 
-  function withLane<T>(lane: number, transition: boolean, fn: () => T): T {
-    setWriteLaneProvider(() => ({ lane, transition }));
+  function withBatch<T>(token: BatchRef, fn: () => T): T {
+    setWriteBatchProvider(() => token);
     try {
       return fn();
     } finally {
-      setWriteLaneProvider(null);
+      setWriteBatchProvider(null);
     }
   }
 
@@ -409,7 +410,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     const c = new Computed({ fn: () => a.state * 10 });
     expect(c.state).toBe(10);
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2);
     });
     expect(isForked()).toBe(true);
@@ -419,7 +420,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     expect(c.state).toBe(20);
 
     // A render world that excludes the transition lane sees committed state.
-    const urgentWorld = makeWorld(LANE_SYNC, currentWriteSeq());
+    const urgentWorld = makeWorld([SYNC_BATCH], currentWriteSeq());
     const prev = setAmbientWorld(urgentWorld);
     try {
       expect(a.state).toBe(1);
@@ -429,7 +430,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     }
 
     // A render world that includes the transition lane sees the new value.
-    const transitionWorld = makeWorld(LANE_T, currentWriteSeq());
+    const transitionWorld = makeWorld([T_BATCH], currentWriteSeq());
     const prev2 = setAmbientWorld(transitionWorld);
     try {
       expect(a.state).toBe(2);
@@ -439,7 +440,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
     }
 
     // Commit: fold the transition lane.
-    fold((entry) => entry.lane === LANE_T);
+    retireBatch(T_BATCH);
     expect(isForked()).toBe(false);
     expect(a.state).toBe(2);
     expect(c.state).toBe(20);
@@ -453,12 +454,12 @@ describe('worlds (transition writes, folds, render passes)', () => {
     });
     expect(seen).toEqual([1]);
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2);
     });
     expect(seen).toEqual([1]); // pending transition: effect not yet re-run
 
-    fold((entry) => entry.lane === LANE_T);
+    retireBatch(T_BATCH);
     expect(seen).toEqual([1, 2]); // committed now
   });
 
@@ -468,15 +469,15 @@ describe('worlds (transition writes, folds, render passes)', () => {
     const sum = new Computed({ fn: () => a.state + b.state * 100 });
     expect(sum.state).toBe(0);
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(1);
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       b.set(1);
     });
 
     // Urgent render: sees b=1, not a=1.
-    const urgentWorld = makeWorld(LANE_SYNC, currentWriteSeq());
+    const urgentWorld = makeWorld([SYNC_BATCH], currentWriteSeq());
     let prev = setAmbientWorld(urgentWorld);
     try {
       expect(sum.state).toBe(100);
@@ -485,8 +486,8 @@ describe('worlds (transition writes, folds, render passes)', () => {
     }
 
     // Transition render after the urgent commit: sees both (rebased).
-    fold((entry) => entry.lane === LANE_SYNC);
-    const transitionWorld = makeWorld(LANE_T, currentWriteSeq());
+    retireBatch(SYNC_BATCH);
+    const transitionWorld = makeWorld([T_BATCH], currentWriteSeq());
     prev = setAmbientWorld(transitionWorld);
     try {
       expect(sum.state).toBe(101);
@@ -494,7 +495,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
       setAmbientWorld(prev);
     }
 
-    fold((entry) => entry.lane === LANE_T);
+    retireBatch(T_BATCH);
     expect(sum.state).toBe(101);
   });
 
@@ -509,29 +510,29 @@ describe('worlds (transition writes, folds, render passes)', () => {
     });
     expect(changes).toEqual([5]);
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2); // head world: c no longer depends on b
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       b.set(6); // committed world: c must update to 6
     });
-    fold((entry) => entry.lane === LANE_SYNC);
+    retireBatch(SYNC_BATCH);
     // Committed world: a=1, b=6 → c=6.
     expect(changes[changes.length - 1]).toBe(6);
 
-    fold((entry) => entry.lane === LANE_T);
+    retireBatch(T_BATCH);
     // Now a=2 committed → c=0.
     expect(changes[changes.length - 1]).toBe(0);
   });
 
   test('a pinned render pass is isolated from later writes', () => {
     const a = new Atom({ state: 1 });
-    setWriteLaneProvider(() => ({ lane: LANE_SYNC, transition: false }));
+    setWriteBatchProvider(() => SYNC_BATCH);
     try {
       a.set(2);
       const pin = currentWriteSeq();
       pinRenderPass(pin);
-      const world = makeWorld(LANE_SYNC, pin);
+      const world = makeWorld([SYNC_BATCH], pin);
 
       a.set(3); // lands after the pass pinned
       const prev = setAmbientWorld(world);
@@ -543,7 +544,7 @@ describe('worlds (transition writes, folds, render passes)', () => {
       expect(a.state).toBe(3); // head read outside the pass
       unpinRenderPass(pin);
     } finally {
-      setWriteLaneProvider(null);
+      setWriteBatchProvider(null);
     }
   });
 });

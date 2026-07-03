@@ -1,6 +1,6 @@
 /**
  * The reactive engine: dependency graph, invalidation, evaluation, and the
- * two-plane world model that makes signals safe under concurrent React.
+ * world model that makes signals safe under concurrent React.
  *
  * ## Shape of the graph
  *
@@ -12,34 +12,48 @@
  * a cursor (`depsTail`), so a re-run with a stable dependency set allocates
  * nothing.
  *
- * ## Planes (worlds)
+ * ## State model: the write log is the truth
  *
- * In steady state there is one plane: every node has one value, one set of
- * dirty flags, and reads/writes behave exactly like a classic signals library.
+ * While React bindings are active, every observable write appends a log
+ * entry: `{ value | apply, batch, seq, retiredAtSeq }`. `batch` is an opaque
+ * token from the React patch identifying the update batch the write belongs
+ * to (`deferred` = transition-like); `seq` is a global write ticket;
+ * `retiredAtSeq` is stamped when the batch retires. Exactly ONE function
+ * derives values from the log:
  *
- * While *uncommitted transition writes* exist, the engine is "forked" into two
- * planes:
+ *     replayLog(atom, includes) — apply the entries the filter admits, in
+ *     write order; plain sets overwrite, functional updates apply to the
+ *     value accumulated so far. This is what gives update()/dispatch()
+ *     React's useState/useReducer rebasing semantics: an updater runs once
+ *     per world that includes it, against THAT world's previous value.
  *
- * - BASE: committed state plus pending urgent (sync-priority) writes. This is
- *   what urgent React renders and effects observe.
- * - HEAD: all writes, including pending transitions. This is what transition
- *   renders and non-render reads observe.
+ * Three kinds of world read the log:
  *
- * Each `Link` carries plane-membership bits because a computed's *dependency
- * set* can differ between planes (`a.state > 1 ? 0 : b.state`). Each node
- * carries per-plane dirty flags; outside forked mode every flag operation
- * treats the two planes as one. When the pending transition writes fold into
- * committed state (a React commit), the planes reconverge. Pure-core users
- * (and benchmarks) never fork.
+ * - COMMITTED: retired entries + pending immediate (non-deferred) entries.
+ *   What urgent renders and effects observe.
+ * - HEAD: every entry. What transition renders and non-render reads observe.
+ * - Render-pass worlds: pinned at pass start; an entry is visible if it
+ *   retired before the pin, or its batch is one the pass includes and it was
+ *   written before the pin. (DESIGN.md §2: this reproduces React's own
+ *   hook-update-queue semantics, including rebasing.)
  *
- * A render pass must not observe writes that landed — or folds that happened —
- * after it started. Atoms keep a small ordered write log while React bindings
- * are active; each entry records its write order (`seq`) and, once committed,
- * its fold order (`foldedAtSeq`). A pass pinned at `maxSeq` resolves an atom
- * to the newest entry that either folded before the pass started
- * (`foldedAtSeq <= maxSeq`) or is carried by a lane the pass includes
- * (`lane ∈ pass.lanes && seq <= maxSeq`). DESIGN.md §2 argues this reproduces
- * React's own hook-update-queue semantics.
+ * COMMITTED and HEAD are hot, so each atom carries a memoized view of each
+ * (`committedLatest` / `headLatest`), advanced incrementally at write time
+ * under one contract: the view equals the replay. Retirement recomputes the
+ * committed view BY replay — that is what rebases pending immediate updaters
+ * on top of a just-retired transition, and what makes rollback structurally
+ * impossible. While no deferred entries are pending (`forkCount === 0`,
+ * "steady"), the two views are one and the engine behaves exactly like a
+ * classic signals library.
+ *
+ * ## Staleness tracking for the two live views
+ *
+ * Nodes carry {Pending, Dirty} flag pairs per live view (the COMMITTED and
+ * HEAD "planes"), and each Link records which planes the dependency edge
+ * exists in — a computed's dependency SET can differ between worlds
+ * (`a.state <= 1 ? b.state : 0`); missing that was a confirmed missed-update
+ * bug class. Outside forked mode every flag operation treats the two planes
+ * as one.
  *
  * ## Notification protocol (the load-bearing ordering rule)
  *
@@ -49,31 +63,33 @@
  *   2. Subscriptions drain: each queued subscription confirms its change with
  *      a pull (equality cut-off, diamonds converge) and, if real, fires
  *      onChange — still synchronously inside the writer's context, which is
- *      what lets React assign the writer's lane to whatever onChange schedules.
- *   3. Effects flush (unless batched): each queued effect re-validates and
- *      re-runs.
+ *      what lets React attribute whatever onChange schedules to the writer's
+ *      batch.
+ *   3. Effects flush (unless batched or mid-evaluation).
  * Confirming *during* propagation is unsound — the first subscriber's pull
  * consumes the source's dirty bit before later subscribers are marked — so
- * notifyWatcher only ever queues.
+ * watchers are only ever queued during the wave. Both deliveries wait for
+ * batch() to end (N writes → at most one notification per subscription).
  *
  * ## Watchedness
  *
  * A node is "watched" when some watcher transitively depends on it;
  * watched-ness propagates as a refcount along dependency links. An atom's
- * 0↔1 transitions drive its `effect` lifecycle option. Unwatched computeds
- * still keep links — push-based invalidation is what makes lazy pulls cheap.
+ * 0↔1 transitions drive its `effect` lifecycle option.
  *
  * ## Other invariants
  *
  * - Evaluation never throws through the graph: a computed's result is a
  *   value, an error, or a suspension, stored as a status; read *sites*
- *   rethrow/suspend (SuspendedRead). A dependency's suspension read during
- *   evaluation re-suspends the reader (same thenable).
- * - Only one tracked evaluation runs at a time (single thread, no yielding
- *   inside an evaluation), so a single RecursedCheck bit serves both planes.
- * - BASE values change only via urgent writes and folds; HEAD values change
- *   on every write. Render passes read via their pinned world, so neither
- *   kind of change can tear a yielded render.
+ *   rethrow/suspend (SuspendedRead).
+ * - Only one tracked evaluation runs at a time, so a single RecursedCheck bit
+ *   serves both planes.
+ * - The committed view changes only via immediate writes and retirements;
+ *   render passes read via their pinned world, so neither kind of change can
+ *   tear a yielded render.
+ * - Zero-allocation steady writes (the "observability gate"): with no
+ *   deferred batch pending and no render pass in flight, an immediate write
+ *   skips the log entirely — nothing could observe the difference.
  */
 
 import { tracer, currentCause, setCurrentCause } from './tracing.ts';
@@ -82,7 +98,7 @@ import { tracer, currentCause, setCurrentCause } from './tracing.ts';
 // Flags, planes, node kinds
 // ---------------------------------------------------------------------------
 
-export const PLANE_BASE = 1;
+export const PLANE_COMMITTED = 1;
 export const PLANE_HEAD = 2;
 export const PLANE_BOTH = 3;
 export type Plane = 1 | 2;
@@ -97,29 +113,28 @@ export const F = {
   RecursedCheck: 1 << 2,
   /** Node was re-invalidated during its own run; next propagate re-marks it. */
   Recursed: 1 << 3,
-  /** BASE plane: definitely stale. */
+  /** COMMITTED view: definitely stale. */
   Dirty: 1 << 4,
-  /** BASE plane: possibly stale; resolve via checkDirty. */
+  /** COMMITTED view: possibly stale; resolve via checkDirty. */
   Pending: 1 << 5,
-  /** HEAD plane (forked mode only): definitely stale. */
+  /** HEAD view (forked mode only): definitely stale. */
   HeadDirty: 1 << 6,
-  /** HEAD plane (forked mode only): possibly stale. */
+  /** HEAD view (forked mode only): possibly stale. */
   HeadPending: 1 << 7,
 } as const;
 
 function dirtyBit(plane: Plane): number {
-  return plane === PLANE_BASE ? F.Dirty : F.HeadDirty;
+  return plane === PLANE_COMMITTED ? F.Dirty : F.HeadDirty;
 }
 function pendingBit(plane: Plane): number {
-  return plane === PLANE_BASE ? F.Pending : F.HeadPending;
+  return plane === PLANE_COMMITTED ? F.Pending : F.HeadPending;
 }
 const ALL_PLANE_BITS = F.Dirty | F.Pending | F.HeadDirty | F.HeadPending;
 
 /**
  * The bits to clear when a pull validates/refreshes `plane`. Outside forked
  * mode the planes are one; leaving the other plane's bits set would let a
- * later propagate wrongly prune ("already marked") — stale HeadPending from
- * steady mode was a confirmed missed-update bug.
+ * later propagate wrongly prune ("already marked").
  */
 function clearBits(plane: Plane): number {
   return forkCount > 0 ? dirtyBit(plane) | pendingBit(plane) : ALL_PLANE_BITS;
@@ -158,38 +173,35 @@ export type Node = {
   subsTail: Link | undefined;
 };
 
+/**
+ * Identity of the update batch a write belongs to. Supplied by the React
+ * patch (an opaque token); the engine reads only `deferred`. Batches retire
+ * exactly once via retireBatch.
+ */
+export type BatchRef = { readonly deferred: boolean };
+
 export type WriteEntry = {
   /** For a plain set: the written value. Unused when `apply` is present. */
   value: unknown;
-  /**
-   * For a functional update (atom.update / ReducerAtom.dispatch): computes
-   * the next value from the previous one. Stored — not eagerly evaluated —
-   * so each world replays it against ITS previous value, exactly like
-   * React replays queued useState/useReducer updaters when rebasing.
-   * Must be pure: it can run once per world that includes it (plus once at
-   * dispatch for the head value), in any order relative to other worlds.
-   */
+  /** For a functional update: pure; replayed once per world that includes it. */
   apply: ((prev: unknown) => unknown) | null;
-  /** Opaque React lane the write's broadcasts were scheduled at. */
-  lane: number;
-  /** Global write sequence number. */
+  batch: BatchRef;
+  /** Global write ticket. */
   seq: number;
-  /** 0 while pending; the fold-time sequence once committed. */
-  foldedAtSeq: number;
-  /** True for transition-priority writes (they fork the planes). */
-  transition: boolean;
+  /** 0 while the batch is pending; a fresh ticket once it retired. */
+  retiredAtSeq: number;
 };
 
 export type AtomNode = Node & {
   /** Debug label (Atom `label` option); used by tracing and visualizers. */
   label: string | null;
-  /** BASE-plane value as of the last pull (alien-signals `currentValue`). */
-  value: unknown;
-  /** BASE-plane latest write, committed to `value` lazily on pull. */
-  buffered: unknown;
-  /** HEAD-plane value (kept in sync with the latest write, eagerly). */
-  headValue: unknown;
-  /** Value before the oldest retained log entry (for pinned render passes). */
+  /** COMMITTED view as of the last pull (alien-signals' `currentValue`). */
+  committedValue: unknown;
+  /** COMMITTED view, latest (alien's `pendingValue`; pulled lazily on read). */
+  committedLatest: unknown;
+  /** HEAD view, latest. Identical to committedLatest while steady. */
+  headLatest: unknown;
+  /** Replay base: the value before the oldest retained log entry. */
   preLogValue: unknown;
   log: WriteEntry[] | null;
   isEqual: (a: unknown, b: unknown) => boolean;
@@ -201,33 +213,36 @@ export const STATUS_VALUE = 0;
 export const STATUS_ERROR = 1;
 export const STATUS_SUSPENDED = 2;
 
+/**
+ * One cached result of a computed in one world. `world` is WORLD_COMMITTED,
+ * WORLD_HEAD, or a RenderWorld (identity-keyed). `gen` stamps which fork
+ * generation the result belongs to: a HEAD result is only trustworthy in the
+ * fork that produced it, and a COMMITTED result computed *during* a fork
+ * excludes that fork's deferred writes (so it must not seed HEAD). This one
+ * uniform rule replaces the old headGen/baseGen/evaluated field triplet.
+ */
+export type ComputedResult = {
+  world: object;
+  status: number;
+  value: unknown;
+  payload: unknown;
+  gen: number;
+};
+
 export type ComputedNode = Node & {
   /** Debug label (Computed `label` option); used by tracing and visualizers. */
   label: string | null;
-  value: unknown;
-  /** STATUS_* for the BASE-plane result. */
-  status: number;
-  /** Error (STATUS_ERROR) or thenable (STATUS_SUSPENDED) for BASE plane. */
-  payload: unknown;
-  headValue: unknown;
-  headStatus: number;
-  headPayload: unknown;
-  /** Fork generation the head mirror was last synced in; see seedHead. */
-  headGen: number;
-  /** Fork generation of the last BASE evaluation made *while forked*. A BASE
-   * result computed during the current fork excludes its transition writes
-   * and must not seed the head mirror. */
-  baseGen: number;
-  /** PLANE_* bits: which planes hold a real result for the current fork. */
-  evaluated: number;
+  /** World-keyed results: COMMITTED, HEAD (while forked), render passes. */
+  results: ComputedResult[];
+  /** Hot-path alias of the WORLD_COMMITTED entry in `results` (steady-mode
+   * reads resolve through this without scanning). */
+  committed: ComputedResult | null;
   fn: (ctx: unknown) => unknown;
   isEqual: (a: unknown, b: unknown) => boolean;
   /** Positional thenable cache for ctx.use across re-evaluations. */
   thenables: unknown[] | null;
   /** Thenable a settle-listener is attached to (dedupe marker). */
   settleAttached: unknown;
-  /** Per-render-pass pure-evaluation cache: [world, value, status, payload]. */
-  renderCache: [object, unknown, number, unknown] | null;
 };
 
 export const WATCHER_EFFECT = 0;
@@ -245,27 +260,59 @@ export type WatcherNode = Node & {
 };
 
 // ---------------------------------------------------------------------------
+// World keys
+// ---------------------------------------------------------------------------
+
+/** Identity keys for the two live views' computed-cache entries. */
+export const WORLD_COMMITTED: object = {};
+export const WORLD_HEAD: object = {};
+
+/**
+ * A render pass's pinned view of the world. Created by the React bindings at
+ * pass start; object identity doubles as the computed-cache key. Immutable
+ * for the life of the pass by construction (writes after the pin are
+ * excluded by seq; retirements after the pin by retiredAtSeq), which is why
+ * pass cache entries never need validation.
+ */
+export type RenderWorld = {
+  /** Tokens of every batch this render pass includes. */
+  includes: readonly BatchRef[];
+  /** Writes/retirements after this ticket are invisible to the pass. */
+  maxSeq: number;
+  /** Cached "does this world include a pending deferred batch"; lazy. */
+  seesDeferred: boolean | null;
+};
+
+function worldIncludesBatch(world: RenderWorld, batch: BatchRef): boolean {
+  const includes = world.includes;
+  for (let i = 0; i < includes.length; i++) {
+    if (includes[i] === batch) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Engine globals
 // ---------------------------------------------------------------------------
 
 let trackVersion = 0;
 let activeSub: Node | undefined;
-let activePlane: Plane = PLANE_BASE;
+let activePlane: Plane = PLANE_COMMITTED;
 let batchDepth = 0;
 let evalDepth = 0;
 
-/** Number of unfolded transition writes; > 0 means the planes are forked. */
+/** Number of unretired deferred entries; > 0 means the views are forked. */
 let forkCount = 0;
-/** Bumped each time the engine enters forked mode; guards head-mirror reuse. */
+/** Bumped each time the engine enters forked mode; stamps cache trust. */
 let forkGen = 0;
 
 let writeSeq = 0;
-/** writeSeq at the last BASE-plane value change (urgent write or fold). */
-let baseChangeSeq = 0;
-/** writeSeq at the last value change in any plane. */
+/** writeSeq at the last COMMITTED-view change (immediate write/retirement). */
+let committedChangeSeq = 0;
+/** writeSeq at the last change in any view. */
 let headChangeSeq = 0;
 
-/** Atoms with non-empty logs, for world reads and fold/GC sweeps. */
+/** Atoms with non-empty logs, for world reads and retirement sweeps. */
 const loggedAtoms: Set<AtomNode> = new Set();
 
 // Effect queue (flat array; the Watching bit doubles as "already queued").
@@ -274,28 +321,21 @@ let effectQueueLength = 0;
 let effectQueueIndex = 0;
 
 // Subscription queue: marked during propagate, confirmed+fired by
-// drainSubscriptions after the wave completes (see the protocol note above).
+// drainSubscriptions after the wave completes.
 const queuedSubscriptions: (WatcherNode | undefined)[] = [];
 let subQueueLength = 0;
 let subQueueIndex = 0;
 
 /**
- * True while fold- or settle-driven propagation runs. Subscriptions are not
- * even marked during it: components already observed those values (they
- * rendered the pending world, or React's suspense ping re-renders them);
+ * True while retirement- or settle-driven propagation runs. Subscriptions are
+ * not even marked during it: components already observed those values;
  * marking without confirming would permanently swallow later notifications.
  */
 let mutedSubscriptions = false;
 
 export type EngineConfig = {
   forbidWritesInComputeds: boolean;
-  /**
-   * Throw when a signal is read raw (not through useSignal/useComputed/a
-   * tracked context) while React is rendering. Such reads are not reactive —
-   * the component won't re-render when the signal changes — and they bypass
-   * the render pass's world, so they're almost always bugs. The React
-   * bindings enable this automatically in development builds.
-   */
+  /** Throw on raw (untracked) signal reads while React renders; see api.ts. */
   throwOnUntrackedReadsInRender: boolean;
 };
 export const config: EngineConfig = {
@@ -303,11 +343,7 @@ export const config: EngineConfig = {
   throwOnUntrackedReadsInRender: false,
 };
 
-/**
- * Installed by the React bindings: returns true while React is rendering on
- * this thread. Only consulted on the raw-read path when
- * throwOnUntrackedReadsInRender is enabled.
- */
+/** Installed by the React bindings: true while React is rendering. */
 let renderGuard: (() => boolean) | null = null;
 export function setRenderGuard(guard: (() => boolean) | null): void {
   renderGuard = guard;
@@ -328,25 +364,15 @@ function checkUntrackedRenderRead(node: Node): void {
   }
 }
 
-export type WriteLaneProvider = () => { lane: number; transition: boolean } | null;
-let writeLaneProvider: WriteLaneProvider | null = null;
-export function setWriteLaneProvider(p: WriteLaneProvider | null): void {
-  writeLaneProvider = p;
-}
-
 /**
- * A render pass's pinned view of the world. Created by the React bindings at
- * pass start; object identity doubles as the render-cache key.
+ * Installed by the React bindings: returns the batch token for a write
+ * happening right now, or null when no React bookkeeping is needed.
  */
-export type RenderWorld = {
-  /** Opaque render lanes. */
-  lanes: number;
-  /** Writes/folds after this sequence number are invisible to the pass. */
-  maxSeq: number;
-  laneIncluded: (lanes: number, lane: number) => boolean;
-  /** Cached "does this world include pending transition writes"; lazy. */
-  seesTransitions: boolean | null;
-};
+export type WriteBatchProvider = () => BatchRef | null;
+let writeBatchProvider: WriteBatchProvider | null = null;
+export function setWriteBatchProvider(p: WriteBatchProvider | null): void {
+  writeBatchProvider = p;
+}
 
 /** Ambient render world; set by the React bindings around render reads. */
 let ambientWorld: RenderWorld | null = null;
@@ -356,11 +382,11 @@ export function setAmbientWorld(world: RenderWorld | null): RenderWorld | null {
   return prev;
 }
 
-// Active render passes pin log entries (and render caches) against GC.
+// Active render passes pin log entries (and pass cache results) against GC.
 const activePins: number[] = [];
 let minActivePin = Infinity;
-/** Computeds holding a renderCache; swept when the last pass unpins. */
-const renderCachedNodes: ComputedNode[] = [];
+/** Computeds holding a render-pass cache result; swept on last unpin. */
+const passCachedNodes: ComputedNode[] = [];
 
 export function pinRenderPass(maxSeq: number): void {
   activePins.push(maxSeq);
@@ -371,7 +397,14 @@ export function unpinRenderPass(maxSeq: number): void {
   if (i !== -1) activePins.splice(i, 1);
   minActivePin = activePins.length === 0 ? Infinity : Math.min(...activePins);
   if (activePins.length === 0) {
-    for (const node of renderCachedNodes.splice(0)) node.renderCache = null;
+    for (const node of passCachedNodes.splice(0)) {
+      // Drop render-pass entries; keep COMMITTED/HEAD entries.
+      const results = node.results;
+      for (let j = results.length - 1; j >= 0; j--) {
+        const w = results[j]!.world;
+        if (w !== WORLD_COMMITTED && w !== WORLD_HEAD) results.splice(j, 1);
+      }
+    }
     sweepLogs();
   }
 }
@@ -389,8 +422,7 @@ export class CycleError extends Error {
 
 /**
  * Thrown by read sites when a computed's current result is a pending
- * thenable. React bindings catch it and suspend via React's `use()`; other
- * readers may await `thenable` and retry.
+ * thenable. React bindings catch it and suspend via React's `use()`.
  */
 export class SuspendedRead {
   thenable: PromiseLike<unknown>;
@@ -421,7 +453,6 @@ function noop(): void {}
 
 let onAtomWatched: ((atom: AtomNode) => void) | null = null;
 let onAtomUnwatched: ((atom: AtomNode) => void) | null = null;
-/** api.ts installs delivery for the Atom `effect` lifecycle option. */
 export function setAtomLifecycleDelivery(
   watched: (atom: AtomNode) => void,
   unwatched: (atom: AtomNode) => void,
@@ -452,7 +483,6 @@ function addWatched(node: Node, delta: number): void {
   }
 }
 
-/** Whether `sub`'s dependencies should count as watched. */
 function subContributesWatch(sub: Node): boolean {
   return sub.kind === KIND_WATCHER || sub.watched > 0;
 }
@@ -514,10 +544,11 @@ function unlink(l: Link, sub: Node): Link | undefined {
   else dep.subs = nextSub;
   if (subContributesWatch(sub)) addWatched(dep, -1);
   if (dep.subs === undefined && dep.kind === KIND_COMPUTED) {
-    // Last subscriber left: force a full recompute on next read and release
-    // this computed's own dependencies (cascades up the chain).
+    // Last subscriber left: forget results (forces recompute on next read)
+    // and release this computed's own dependencies (cascades up the chain).
     dep.flags = F.Mutable | F.Dirty | F.HeadDirty;
-    (dep as ComputedNode).evaluated = 0;
+    (dep as ComputedNode).results.length = 0;
+    (dep as ComputedNode).committed = null;
     let depOfDep = dep.deps;
     while (depOfDep !== undefined) {
       depOfDep = unlink(depOfDep, dep);
@@ -621,7 +652,7 @@ function propagate(subsHead: Link, mask: number, cycleGuard: Node | undefined): 
         const flags = sub.flags;
         const linkMask = l.planes & mask;
         const wantPending =
-          ((linkMask & PLANE_BASE) !== 0 ? F.Pending : 0) |
+          ((linkMask & PLANE_COMMITTED) !== 0 ? F.Pending : 0) |
           ((linkMask & PLANE_HEAD) !== 0 ? F.HeadPending : 0);
         // A plane is "already marked" if the sub has Pending or Dirty there.
         const alreadyMarked =
@@ -718,14 +749,10 @@ function queueWatcher(w: WatcherNode, planeMask: number): void {
 
 /**
  * Confirms and fires queued subscriptions, then flushes queued effects.
- * Called after every propagation wave — write sites, fold, settle, batch end,
- * and after reads whose lazy pulls promoted watchers.
- *
- * Both deliveries wait for `batch()` to end: the queue's dedupe (the Watching
- * bit) means N writes inside one batch produce at most one confirmation and
- * one onChange per subscription. Delivery still happens synchronously inside
- * whatever context called endBatch — for `startSignalTransition`, inside the
- * transition scope, which is what React lane attribution needs.
+ * Called after every propagation wave. Both deliveries wait for `batch()` to
+ * end: the queue's dedupe means N writes inside one batch produce at most one
+ * confirmation and one onChange per subscription, still synchronously inside
+ * whatever context called endBatch (batch attribution needs that).
  */
 function deliverNotifications(): void {
   if (batchDepth !== 0) return;
@@ -744,16 +771,20 @@ function drainSubscriptions(): void {
     const planes = w.queuedPlanes;
     w.queuedPlanes = 0;
     // Confirm against every plane the marks came from: a forked write can
-    // change BASE while HEAD cuts off (or vice versa) — checking one plane
-    // and clearing both would swallow the change.
+    // change COMMITTED while HEAD cuts off (or vice versa) — checking one
+    // plane and clearing both would swallow the change.
     let firedPlane: Plane | 0 = 0;
     if (forkCount > 0 && (planes & PLANE_HEAD) !== 0 && confirmPlane(w, PLANE_HEAD)) {
       firedPlane = PLANE_HEAD;
-    } else if ((planes & PLANE_BASE) !== 0 && confirmPlane(w, PLANE_BASE)) {
-      firedPlane = PLANE_BASE;
-    } else if (forkCount === 0 && (planes & PLANE_HEAD) !== 0 && confirmPlane(w, PLANE_BASE)) {
-      // Steady mode: HEAD marks are BASE marks.
-      firedPlane = PLANE_BASE;
+    } else if ((planes & PLANE_COMMITTED) !== 0 && confirmPlane(w, PLANE_COMMITTED)) {
+      firedPlane = PLANE_COMMITTED;
+    } else if (
+      forkCount === 0 &&
+      (planes & PLANE_HEAD) !== 0 &&
+      confirmPlane(w, PLANE_COMMITTED)
+    ) {
+      // Steady mode: HEAD marks are COMMITTED marks.
+      firedPlane = PLANE_COMMITTED;
     }
     w.flags &= ~ALL_PLANE_BITS;
     if (firedPlane !== 0 && w.onChange !== null) {
@@ -781,7 +812,7 @@ function confirmPlane(w: WatcherNode, plane: Plane): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Pull phase: checkDirty + evaluation
+// Pull phase: checkDirty
 // ---------------------------------------------------------------------------
 
 /**
@@ -804,21 +835,18 @@ function checkDirty(startLink: Link, startSub: Node, plane: Plane): boolean {
     while (l !== undefined) {
       if ((l.planes & plane) !== 0) {
         if ((sub.flags & dBit) !== 0) {
-          // Something already proved us dirty (e.g. a shallowPropagate fired
-          // by an update we triggered earlier in this walk).
           dirty = true;
           break;
         }
         const dep = l.dep;
         const depFlags = dep.flags;
         if (dep.kind === KIND_ATOM) {
-          // In HEAD, an uncommitted BASE write (F.Dirty from steady mode,
-          // before the fork) also means the head value moved — head values
-          // are written eagerly, so both bits imply "changed".
-          const atomDirtyBits = plane === PLANE_BASE ? F.Dirty : F.HeadDirty | F.Dirty;
+          // In HEAD, an unpulled COMMITTED-view write (F.Dirty from steady
+          // mode, before the fork) also means the head value moved — head
+          // values are written eagerly, so both bits imply "changed".
+          const atomDirtyBits = plane === PLANE_COMMITTED ? F.Dirty : F.HeadDirty | F.Dirty;
           if ((depFlags & atomDirtyBits) !== 0) {
-            const changed = updateAtomForPlane(dep as AtomNode, plane);
-            if (changed) {
+            if (updateAtomForPlane(dep as AtomNode, plane)) {
               if (dep.subs !== undefined && dep.subs.nextSub !== undefined) {
                 shallowPropagate(dep.subs, plane);
               }
@@ -877,10 +905,10 @@ function checkDirty(startLink: Link, startSub: Node, plane: Plane): boolean {
 }
 
 /**
- * Brings an atom's plane value up to date and reports whether it changed.
- * BASE: commits the buffered write (alien-signals' lazy commit). HEAD: values
- * are eager, so a dirty bit means "changed"; a pre-fork uncommitted BASE
- * write is committed here too (it is part of head history by definition).
+ * Brings an atom's plane view up to date and reports whether it changed.
+ * COMMITTED: pulls the latest write (alien-signals' lazy commit). HEAD:
+ * values are eager, so a dirty bit means "changed"; an unpulled pre-fork
+ * write is pulled here too (it is part of head history by definition).
  */
 function updateAtomForPlane(atom: AtomNode, plane: Plane): boolean {
   if (plane === PLANE_HEAD) {
@@ -888,11 +916,11 @@ function updateAtomForPlane(atom: AtomNode, plane: Plane): boolean {
     atom.flags &= ~F.HeadDirty;
     if ((atom.flags & F.Dirty) !== 0) {
       if (updateAtom(atom)) {
-        // Cross-plane promotion: this HEAD walk consumed the BASE dirty bit,
-        // so every BASE-Pending subscriber (including the very node pulling
-        // us in HEAD) must be promoted now — no single-subscriber shortcut,
-        // that optimization is only valid within one plane.
-        shallowPropagate(atom.subs, PLANE_BASE);
+        // Cross-plane promotion: this HEAD walk consumed the COMMITTED dirty
+        // bit; every COMMITTED-Pending subscriber must be promoted now — no
+        // single-subscriber shortcut, that optimization is only valid within
+        // one plane.
+        shallowPropagate(atom.subs, PLANE_COMMITTED);
         changed = true;
       }
     }
@@ -901,13 +929,13 @@ function updateAtomForPlane(atom: AtomNode, plane: Plane): boolean {
   return updateAtom(atom);
 }
 
-/** Commits an atom's buffered write in BASE; returns "value changed". */
+/** Pulls an atom's latest committed-view write into its pulled value. */
 function updateAtom(atom: AtomNode): boolean {
   atom.flags &= ~F.Dirty;
-  const prev = atom.value;
-  const next = atom.buffered;
+  const prev = atom.committedValue;
+  const next = atom.committedLatest;
   if (atom.isEqual(prev, next)) return false;
-  atom.value = next;
+  atom.committedValue = next;
   return true;
 }
 
@@ -915,13 +943,29 @@ function updateAtom(atom: AtomNode): boolean {
 let evalThenableIndex = 0;
 let evalThenables: unknown[] | null = null;
 
+// ---------------------------------------------------------------------------
+// Computed results (world-keyed cache)
+// ---------------------------------------------------------------------------
+
+function findResult(c: ComputedNode, world: object): ComputedResult | null {
+  if (world === WORLD_COMMITTED) return c.committed;
+  const results = c.results;
+  for (let i = 0; i < results.length; i++) {
+    if (results[i]!.world === world) return results[i]!;
+  }
+  return null;
+}
+
+function planeWorld(plane: Plane): object {
+  return plane === PLANE_HEAD && forkCount > 0 ? WORLD_HEAD : WORLD_COMMITTED;
+}
+
 /**
  * Re-evaluates a computed in `plane`. Returns whether its observable result
  * (value, error, or suspension) changed. Never throws — except CycleError,
  * which is a programming error that must fail loudly at the offending site.
  */
 function updateComputed(c: ComputedNode, plane: Plane): boolean {
-  if (plane === PLANE_HEAD) seedHead(c);
   const frame = startTracking(c, plane);
   const prevThenables = evalThenables;
   const prevThenableIndex = evalThenableIndex;
@@ -929,7 +973,7 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
   evalThenables = c.thenables;
   evalThenableIndex = 0;
   ++evalDepth;
-  ++batchDepth; // defer effect flushes triggered by writes inside the getter
+  ++batchDepth; // defer notification delivery for writes inside the getter
   const traceCause =
     tracer !== null
       ? setCurrentCause(tracer.emit('computed-eval', currentCause, c, { plane }))
@@ -942,12 +986,9 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
   try {
     value = c.fn(computedCtx);
   } catch (e) {
-    if (e instanceof SuspendSignal) {
-      status = STATUS_SUSPENDED;
-      payload = e.thenable;
-    } else if (e instanceof SuspendedRead) {
-      // A dependency is suspended: this computed is suspended on the same
-      // thenable (keeps payload identity stable for the equality cutoff).
+    if (e instanceof SuspendSignal || e instanceof SuspendedRead) {
+      // A pending ctx.use, or a suspended dependency: this computed suspends
+      // on the same thenable (payload identity stays stable for the cutoff).
       status = STATUS_SUSPENDED;
       payload = e.thenable;
     } else if (e instanceof CycleError) {
@@ -969,86 +1010,75 @@ function updateComputed(c: ComputedNode, plane: Plane): boolean {
     endTracking(c, frame, plane);
     if (tracer !== null) setCurrentCause(traceCause);
   }
+
+  const world = planeWorld(plane);
+  let entry = findResult(c, world);
   let changed: boolean;
   try {
-    changed = commitComputedResult(c, plane, status, value, payload);
+    // Note: entry.gen is deliberately NOT part of change detection — gen
+    // governs seeding trust (ensureHeadResult), and a stale-generation entry
+    // holding an equal value is still a legitimate equality cutoff.
+    changed =
+      entry === null ||
+      entry.status !== status ||
+      (status === STATUS_VALUE ? !c.isEqual(entry.value, value) : entry.payload !== payload);
   } catch (compareError) {
     // A throwing user isEqual must not leave the node clean-with-stale-value:
     // surface the error to this read AND stay dirty so the next read retries.
-    commitComputedResult(c, plane, STATUS_ERROR, undefined, compareError);
+    status = STATUS_ERROR;
+    payload = compareError;
+    value = undefined;
     c.flags |= dirtyBit(plane);
     changed = true;
   }
+  if (entry === null) {
+    entry = { world, status, value, payload, gen: forkGen };
+    c.results.push(entry);
+    if (world === WORLD_COMMITTED) c.committed = entry;
+  } else {
+    entry.status = status;
+    entry.value = value;
+    entry.payload = payload;
+    entry.gen = forkGen;
+  }
+  c.flags |= F.Mutable;
   if (status === STATUS_SUSPENDED) attachSettleListener(c, payload as InstrumentedThenable, plane);
   if (cycleError !== null) throw cycleError;
   return changed;
 }
 
 /**
- * Entering forked mode lazily: a computed's head mirror is only trustworthy
- * if it was synced during the current fork generation; otherwise seed it from
- * BASE (the state both planes shared before the fork). Dirtiness flags decide
- * whether the seed is then revalidated.
+ * The trust rule for HEAD results (replacing the old headGen/baseGen/
+ * evaluated triplet with the uniform `gen` stamp): a HEAD entry is valid
+ * only within the fork generation that produced it. When missing or stale,
+ * seed from the COMMITTED entry iff that entry predates this fork — a
+ * COMMITTED result computed DURING the fork excludes the fork's deferred
+ * writes and must not stand in for head state. Returns null when there is no
+ * trustworthy seed (caller evaluates fresh).
  */
-function seedHead(c: ComputedNode): void {
-  if (c.headGen !== forkGen) {
-    c.headGen = forkGen;
-    if ((c.evaluated & PLANE_BASE) !== 0 && c.baseGen !== forkGen) {
-      // The BASE result predates this fork: it is exactly the state both
-      // planes shared, and dirty flags cover anything written since.
-      c.headValue = c.value;
-      c.headStatus = c.status;
-      c.headPayload = c.payload;
-      c.evaluated |= PLANE_HEAD;
+function ensureHeadResult(c: ComputedNode): ComputedResult | null {
+  let head = findResult(c, WORLD_HEAD);
+  if (head !== null && head.gen === forkGen) return head;
+  const committed = findResult(c, WORLD_COMMITTED);
+  if (committed !== null && committed.gen !== forkGen) {
+    if (head === null) {
+      head = {
+        world: WORLD_HEAD,
+        status: committed.status,
+        value: committed.value,
+        payload: committed.payload,
+        gen: forkGen,
+      };
+      c.results.push(head);
     } else {
-      // BASE was (re)computed during this fork — it excludes the fork's
-      // transition writes — or was never computed: evaluate HEAD fresh.
-      c.evaluated &= ~PLANE_HEAD;
+      head.status = committed.status;
+      head.value = committed.value;
+      head.payload = committed.payload;
+      head.gen = forkGen;
     }
+    return head;
   }
-}
-
-function commitComputedResult(
-  c: ComputedNode,
-  plane: Plane,
-  status: number,
-  value: unknown,
-  payload: unknown,
-): boolean {
-  c.flags |= F.Mutable;
-  if (plane === PLANE_HEAD && forkCount > 0) {
-    const firstEval = (c.evaluated & PLANE_HEAD) === 0;
-    const changed =
-      firstEval ||
-      c.headStatus !== status ||
-      (status === STATUS_VALUE ? !c.isEqual(c.headValue, value) : c.headPayload !== payload);
-    c.headStatus = status;
-    c.headValue = value;
-    c.headPayload = payload;
-    c.headGen = forkGen;
-    c.evaluated |= PLANE_HEAD;
-    return changed;
-  }
-  const firstEval = (c.evaluated & PLANE_BASE) === 0;
-  const changed =
-    firstEval ||
-    c.status !== status ||
-    (status === STATUS_VALUE ? !c.isEqual(c.value, value) : c.payload !== payload);
-  c.status = status;
-  c.value = value;
-  c.payload = payload;
-  c.evaluated |= PLANE_BASE;
-  if (forkCount > 0) c.baseGen = forkGen;
-  if (forkCount === 0) {
-    // Steady state: the planes are one; keep head mirrors in sync so the next
-    // fork can seed cheaply.
-    c.headStatus = status;
-    c.headValue = value;
-    c.headPayload = payload;
-    c.headGen = forkGen;
-    c.evaluated |= PLANE_HEAD;
-  }
-  return changed;
+  return null;
 }
 
 /**
@@ -1063,13 +1093,10 @@ function attachSettleListener(c: ComputedNode, thenable: InstrumentedThenable, p
   const onSettle = (): void => {
     if (c.settleAttached !== thenable) return;
     c.settleAttached = null;
-    const head = plane === PLANE_HEAD && forkCount > 0;
-    const isCurrent =
-      (head ? c.headStatus : c.status) === STATUS_SUSPENDED &&
-      (head ? c.headPayload : c.payload) === thenable;
-    if (!isCurrent) return;
+    const entry = findResult(c, planeWorld(plane));
+    if (entry === null || entry.status !== STATUS_SUSPENDED || entry.payload !== thenable) return;
     if (tracer !== null) tracer.emit('settle', currentCause, c);
-    c.flags |= head ? F.HeadDirty : F.Dirty;
+    c.flags |= plane === PLANE_HEAD && forkCount > 0 ? F.HeadDirty : F.Dirty;
     if (c.subs !== undefined) {
       const prevMuted = mutedSubscriptions;
       mutedSubscriptions = true;
@@ -1144,6 +1171,32 @@ const computedCtx: ComputedCtx = {
 };
 
 // ---------------------------------------------------------------------------
+// The single value-derivation function
+// ---------------------------------------------------------------------------
+
+/**
+ * THE definition of an atom's value in a world: starting from the value
+ * before the retained log, apply — in write order — every entry the filter
+ * admits. The memoized views, render reads, retirement, and sweeping are all
+ * defined in terms of this function.
+ */
+function replayLog(atom: AtomNode, includes: (e: WriteEntry) => boolean): unknown {
+  let value = atom.preLogValue;
+  const log = atom.log;
+  if (log !== null) {
+    for (let i = 0; i < log.length; i++) {
+      const e = log[i]!;
+      if (includes(e)) {
+        value = e.apply !== null ? e.apply(value) : e.value;
+      }
+    }
+  }
+  return value;
+}
+
+const includesCommitted = (e: WriteEntry): boolean => e.retiredAtSeq !== 0 || !e.batch.deferred;
+
+// ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
 
@@ -1153,44 +1206,34 @@ export function readAtom(atom: AtomNode): unknown {
     if ((sub.flags & F.RecursedCheck) !== 0) {
       link(atom, sub, forkCount > 0 ? activePlane : PLANE_BOTH);
     }
-    if (activePlane === PLANE_HEAD && forkCount > 0) return atom.headValue;
-    return baseAtomValue(atom);
+    if (activePlane === PLANE_HEAD && forkCount > 0) return atom.headLatest;
+    return committedAtomValue(atom);
   }
   const world = ambientWorld;
   if (world !== null) return resolveAtomInWorld(atom, world);
   // Untracked read outside render: latest-write ("head") semantics.
   checkUntrackedRenderRead(atom);
-  const value = forkCount > 0 ? atom.headValue : baseAtomValue(atom);
-  deliverNotifications(); // a lazy commit may have promoted watchers
+  const value = forkCount > 0 ? atom.headLatest : committedAtomValue(atom);
+  deliverNotifications(); // a lazy pull may have promoted watchers
   return value;
 }
 
-function baseAtomValue(atom: AtomNode): unknown {
+function committedAtomValue(atom: AtomNode): unknown {
   if ((atom.flags & F.Dirty) !== 0) {
-    if (updateAtom(atom)) shallowPropagate(atom.subs, PLANE_BASE);
+    if (updateAtom(atom)) shallowPropagate(atom.subs, PLANE_COMMITTED);
   }
-  return atom.value;
+  return atom.committedValue;
 }
 
 function resolveAtomInWorld(atom: AtomNode, world: RenderWorld): unknown {
   const log = atom.log;
-  if (log === null || log.length === 0) return baseAtomValue(atom);
-  // Replay visible entries in write order (matching React's queue replay):
-  // plain sets overwrite; functional updates apply to the value accumulated
-  // so far IN THIS WORLD — that's what makes an updater rebase correctly.
-  let value = atom.preLogValue;
-  for (let i = 0; i < log.length; i++) {
-    const e = log[i]!;
-    // An entry is visible if it folded before the pass pinned (fold-time
-    // stamp!) or if the pass's lanes carry it and it existed at pin time.
-    const visible =
-      (e.foldedAtSeq !== 0 && e.foldedAtSeq <= world.maxSeq) ||
-      (e.seq <= world.maxSeq && world.laneIncluded(world.lanes, e.lane));
-    if (visible) {
-      value = e.apply !== null ? e.apply(value) : e.value;
-    }
-  }
-  return value;
+  if (log === null || log.length === 0) return committedAtomValue(atom);
+  return replayLog(
+    atom,
+    (e) =>
+      (e.retiredAtSeq !== 0 && e.retiredAtSeq <= world.maxSeq) ||
+      (e.seq <= world.maxSeq && worldIncludesBatch(world, e.batch)),
+  );
 }
 
 /**
@@ -1206,41 +1249,45 @@ export function readComputed(c: ComputedNode): unknown {
   if (sub === undefined) {
     const world = ambientWorld;
     if (world !== null) return resolveComputedInWorld(c, world);
+    checkUntrackedRenderRead(c);
   }
   // Inside a tracked evaluation, stay in that evaluation's plane; untracked
   // non-render reads get latest-write ("head") semantics, matching atoms.
-  if (sub === undefined) checkUntrackedRenderRead(c);
   const plane: Plane =
-    forkCount === 0 ? PLANE_BASE : sub !== undefined ? activePlane : PLANE_HEAD;
-  pullComputed(c, plane);
+    forkCount === 0 ? PLANE_COMMITTED : sub !== undefined ? activePlane : PLANE_HEAD;
+  let entry = pullComputed(c, plane);
+  // The pull may have re-evaluated; re-fetch is only needed if it did (the
+  // entry object is mutated in place otherwise).
   if (sub !== undefined && (sub.flags & F.RecursedCheck) !== 0) {
     link(c, sub, forkCount > 0 ? plane : PLANE_BOTH);
   }
-  const result = unwrapResultOrThrow(c, plane, sub === undefined);
-  return result;
+  if (sub === undefined) deliverNotifications(); // lazy pulls may promote watchers
+  return unwrapEntry(entry);
 }
 
-function unwrapResultOrThrow(c: ComputedNode, plane: Plane, deliver: boolean): unknown {
-  const head = plane === PLANE_HEAD && forkCount > 0;
-  const status = head ? c.headStatus : c.status;
-  if (deliver) deliverNotifications(); // lazy pulls may have promoted watchers
-  if (status === STATUS_VALUE) return head ? c.headValue : c.value;
-  if (status === STATUS_ERROR) throw head ? c.headPayload : c.payload;
-  throw new SuspendedRead((head ? c.headPayload : c.payload) as PromiseLike<unknown>);
+function unwrapEntry(entry: ComputedResult): unknown {
+  if (entry.status === STATUS_VALUE) return entry.value;
+  if (entry.status === STATUS_ERROR) throw entry.payload;
+  throw new SuspendedRead(entry.payload as PromiseLike<unknown>);
 }
 
-/** Brings the computed's `plane` result up to date (lazy pull). */
-function pullComputed(c: ComputedNode, plane: Plane): void {
+/** Brings the computed's `plane` result up to date; returns the entry. */
+function pullComputed(c: ComputedNode, plane: Plane): ComputedResult {
   const dBit = dirtyBit(plane);
   const pBit = pendingBit(plane);
-  if (plane === PLANE_HEAD) seedHead(c);
-  const flags = c.flags;
-  const planeEvaluated =
-    (c.evaluated & (plane === PLANE_HEAD && forkCount > 0 ? PLANE_HEAD : PLANE_BASE)) !== 0;
-  if (!planeEvaluated) {
-    updateComputed(c, plane); // first evaluation in this plane
-    return;
+  const world = planeWorld(plane);
+  let entry = findResult(c, world);
+  if (world === WORLD_HEAD && (entry === null || entry.gen !== forkGen)) {
+    entry = ensureHeadResult(c);
+    if (entry === null) {
+      updateComputed(c, plane); // no trustworthy seed: evaluate fresh
+      return findResult(c, world)!;
+    }
+  } else if (entry === null) {
+    updateComputed(c, plane); // first-ever evaluation
+    return findResult(c, world)!;
   }
+  const flags = c.flags;
   if ((flags & dBit) !== 0) {
     if (updateComputed(c, plane)) shallowPropagate(c.subs, plane);
   } else if ((flags & pBit) !== 0) {
@@ -1249,25 +1296,22 @@ function pullComputed(c: ComputedNode, plane: Plane): void {
     } else {
       c.flags &= ~(forkCount > 0 ? pBit : F.Pending | F.HeadPending);
     }
-  } else {
+  } else if (entry.status === STATUS_SUSPENDED) {
     // Clean — but suspended results self-heal once their thenable settles.
-    const status = plane === PLANE_HEAD && forkCount > 0 ? c.headStatus : c.status;
-    if (status === STATUS_SUSPENDED) {
-      const payload = (plane === PLANE_HEAD && forkCount > 0 ? c.headPayload : c.payload) as
-        | InstrumentedThenable
-        | undefined;
-      if (payload !== undefined && payload.status !== undefined && payload.status !== 'pending') {
-        updateComputed(c, plane);
-      }
+    const payload = entry.payload as InstrumentedThenable | undefined;
+    if (payload !== undefined && payload.status !== undefined && payload.status !== 'pending') {
+      updateComputed(c, plane);
     }
   }
+  return entry;
 }
 
 /**
  * Resolves a computed inside a render pass. Fast path: when nothing changed
- * since the pass pinned, the live plane the pass corresponds to already holds
- * the right answer (and stays valid for the whole pass). Slow path: a pure,
- * per-pass-cached evaluation against the pinned world.
+ * since the pass pinned and no pending entry is excluded by the pass's
+ * batches, a live view already holds the right answer (and stays valid for
+ * the whole pass). Slow path: a pure, per-pass-cached evaluation against the
+ * pinned world — never re-validated, because the pinned world is immutable.
  */
 function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
   // Only computeds already participating in the graph may take the linking
@@ -1277,20 +1321,17 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
   // component commits and subscribes.
   const participates = c.watched > 0 || c.subs !== undefined || c.deps !== undefined;
   if (participates) {
-    // A live plane can stand in for the pass's world only if the plane holds
-    // no unfolded write the pass's lanes exclude (a transition render must
-    // not see a pending urgent write through HEAD, and vice versa).
-    if (worldSeesTransitionWrites(world)) {
-      if (headChangeSeq <= world.maxSeq && unfoldedEntriesAllIncluded(world, true)) {
-        return readInPlane(c, forkCount > 0 ? PLANE_HEAD : PLANE_BASE);
+    if (worldSeesDeferred(world)) {
+      if (headChangeSeq <= world.maxSeq && pendingEntriesAllIncluded(world, true)) {
+        return readInPlane(c, forkCount > 0 ? PLANE_HEAD : PLANE_COMMITTED);
       }
-    } else if (baseChangeSeq <= world.maxSeq && unfoldedEntriesAllIncluded(world, false)) {
-      // BASE (committed + urgent write-throughs) is exactly this world.
-      return readInPlane(c, PLANE_BASE);
+    } else if (committedChangeSeq <= world.maxSeq && pendingEntriesAllIncluded(world, false)) {
+      // COMMITTED (retired + immediate write-throughs) is exactly this world.
+      return readInPlane(c, PLANE_COMMITTED);
     }
   }
-  const cached = c.renderCache;
-  if (cached !== null && cached[0] === world) return unwrapCached(cached);
+  const cached = findResult(c, world);
+  if (cached !== null) return unwrapEntry(cached);
   if ((c.flags & F.RecursedCheck) !== 0) {
     throw new CycleError('Computed read during its own evaluation (dependency cycle).');
   }
@@ -1322,10 +1363,20 @@ function resolveComputedInWorld(c: ComputedNode, world: RenderWorld): unknown {
     evalThenables = prevThenables;
     evalThenableIndex = prevIndex;
   }
-  if (c.renderCache === null) renderCachedNodes.push(c);
-  c.renderCache = [world, value, status, payload];
+  let hadPassEntry = false;
+  const results = c.results;
+  for (let i = 0; i < results.length; i++) {
+    const w = results[i]!.world;
+    if (w !== WORLD_COMMITTED && w !== WORLD_HEAD) {
+      hadPassEntry = true;
+      break;
+    }
+  }
+  if (!hadPassEntry) passCachedNodes.push(c);
+  const entry: ComputedResult = { world, status, value, payload, gen: forkGen };
+  results.push(entry);
   if (tracer !== null) tracer.emit('render-read', currentCause, c, { pinned: true, status });
-  return unwrapCached(c.renderCache);
+  return unwrapEntry(entry);
 }
 
 function readInPlane(c: ComputedNode, plane: Plane): unknown {
@@ -1333,32 +1384,25 @@ function readInPlane(c: ComputedNode, plane: Plane): unknown {
   const prevPlane = activePlane;
   activePlane = plane;
   try {
-    pullComputed(c, plane);
-    return unwrapResultOrThrow(c, plane, false);
+    return unwrapEntry(pullComputed(c, plane));
   } finally {
     activePlane = prevPlane;
     setAmbientWorld(prevWorld);
   }
 }
 
-function unwrapCached(cached: [object, unknown, number, unknown]): unknown {
-  if (cached[2] === STATUS_VALUE) return cached[1];
-  if (cached[2] === STATUS_ERROR) throw cached[3];
-  throw new SuspendedRead(cached[3] as PromiseLike<unknown>);
-}
-
 /**
  * Plane-explicit untracked read, for the React bindings' post-subscribe
- * fixups: "what would an urgent render (BASE) / the pending world (HEAD)
- * show right now?". Throws errors/SuspendedRead like a normal read.
+ * fixups: "what would an urgent render (COMMITTED) / the pending world
+ * (HEAD) show right now?".
  */
 export function peekNodeValue(node: Node, plane: Plane): unknown {
-  const requested: Plane = forkCount > 0 ? plane : PLANE_BASE;
+  const requested: Plane = forkCount > 0 ? plane : PLANE_COMMITTED;
   try {
     if (node.kind === KIND_ATOM) {
       return requested === PLANE_HEAD
-        ? (node as AtomNode).headValue
-        : baseAtomValue(node as AtomNode);
+        ? (node as AtomNode).headLatest
+        : committedAtomValue(node as AtomNode);
     }
     return readInPlane(node as ComputedNode, requested);
   } finally {
@@ -1367,40 +1411,40 @@ export function peekNodeValue(node: Node, plane: Plane): unknown {
   }
 }
 
-function worldSeesTransitionWrites(world: RenderWorld): boolean {
+function worldSeesDeferred(world: RenderWorld): boolean {
   if (forkCount === 0) return false;
-  if (world.seesTransitions !== null) return world.seesTransitions;
+  if (world.seesDeferred !== null) return world.seesDeferred;
   let sees = false;
   outer: for (const atom of loggedAtoms) {
     const log = atom.log;
     if (log === null) continue;
     for (let i = 0; i < log.length; i++) {
       const e = log[i]!;
-      if (e.foldedAtSeq === 0 && e.transition && world.laneIncluded(world.lanes, e.lane)) {
+      if (e.retiredAtSeq === 0 && e.batch.deferred && worldIncludesBatch(world, e.batch)) {
         sees = true;
         break outer;
       }
     }
   }
-  world.seesTransitions = sees;
+  world.seesDeferred = sees;
   return sees;
 }
 
 /**
- * Is every unfolded write's lane included in the world? When
- * `includeTransitions` is false, unfolded transition entries are ignored
- * (they are absent from BASE by construction, and the caller already knows
- * the world excludes them).
+ * Is every pending write's batch included in the world? When
+ * `includeDeferred` is false, pending deferred entries are ignored (they are
+ * absent from the COMMITTED view by construction, and the caller already
+ * knows the world excludes them).
  */
-function unfoldedEntriesAllIncluded(world: RenderWorld, includeTransitions: boolean): boolean {
+function pendingEntriesAllIncluded(world: RenderWorld, includeDeferred: boolean): boolean {
   for (const atom of loggedAtoms) {
     const log = atom.log;
     if (log === null) continue;
     for (let i = 0; i < log.length; i++) {
       const e = log[i]!;
-      if (e.foldedAtSeq !== 0) continue;
-      if (!includeTransitions && e.transition) continue;
-      if (!world.laneIncluded(world.lanes, e.lane)) return false;
+      if (e.retiredAtSeq !== 0) continue;
+      if (!includeDeferred && e.batch.deferred) continue;
+      if (!worldIncludesBatch(world, e.batch)) return false;
     }
   }
   return true;
@@ -1418,10 +1462,7 @@ export function writeAtom(atom: AtomNode, value: unknown): void {
 /**
  * Functional update (atom.update / ReducerAtom.dispatch): `apply` is stored
  * in the write log and REPLAYED per world, giving React useState/useReducer
- * rebasing semantics. An urgent `x => x * 2` interleaving a pending
- * transition's `x => x + 1` doubles the committed value for the urgent
- * render, and doubles the incremented value when the transition commits —
- * the updater runs once per world that includes it. It must be pure.
+ * rebasing semantics. It must be pure.
  */
 export function applyAtom(atom: AtomNode, apply: (prev: unknown) => unknown): void {
   writeAtomImpl(atom, undefined, apply);
@@ -1442,7 +1483,7 @@ function writeAtomImpl(
       'Writing to an atom inside a computed is forbidden (forbidWritesInComputeds).',
     );
   }
-  const laneInfo = writeLaneProvider !== null ? writeLaneProvider() : null;
+  const batch = writeBatchProvider !== null ? writeBatchProvider() : null;
   const cause =
     tracer !== null ? setCurrentCause(tracer.emit('atom-write', currentCause, atom)) : 0;
   try {
@@ -1453,18 +1494,18 @@ function writeAtomImpl(
         ? activeSub
         : undefined;
 
-    if (laneInfo !== null && laneInfo.transition) {
-      // Transition write: log it (for world reads and the eventual fold) and
-      // advance HEAD only. Updaters evaluate here against the head value —
-      // their position in head history — and are replayed for other worlds.
-      const seq = appendLog(atom, value, apply, laneInfo.lane, true);
+    if (batch !== null && batch.deferred) {
+      // Deferred write: log it and advance HEAD only. Updaters evaluate here
+      // against the head value — their position in head history — and are
+      // replayed for other worlds.
+      appendLog(atom, value, apply, batch);
       if (forkCount === 0) ++forkGen;
       ++forkCount;
-      const headNext = apply !== null ? apply(atom.headValue) : value;
-      if (!atom.isEqual(atom.headValue, headNext)) {
-        atom.headValue = headNext;
+      const headNext = apply !== null ? apply(atom.headLatest) : value;
+      if (!atom.isEqual(atom.headLatest, headNext)) {
+        atom.headLatest = headNext;
         atom.flags |= F.HeadDirty;
-        headChangeSeq = seq;
+        headChangeSeq = writeSeq;
         if (atom.subs !== undefined) {
           propagate(atom.subs, PLANE_HEAD, cycleGuard);
         }
@@ -1473,32 +1514,38 @@ function writeAtomImpl(
       return;
     }
 
-    let entrySeq = 0;
-    if (laneInfo !== null) entrySeq = appendLog(atom, value, apply, laneInfo.lane, false);
+    // The observability gate: an immediate write's log entry only matters if
+    // some observer could distinguish worlds — while forked, or while a
+    // render pass is pinned. A plain event-handler set() allocates nothing.
+    if (batch !== null && (forkCount > 0 || activePins.length > 0)) {
+      appendLog(atom, value, apply, batch);
+    } else {
+      ++writeSeq;
+    }
 
-    // Urgent/plain write: write-through on BASE (and HEAD, since urgent
-    // writes are chronologically part of the head world too). For updaters
-    // the two planes evaluate independently against their own previous
-    // values — that IS the rebase.
+    // Immediate/plain write: write-through on COMMITTED (and HEAD, since
+    // immediate writes are chronologically part of the head world too). For
+    // updaters the two views evaluate independently against their own
+    // previous values — that IS the rebase.
     let mask = 0;
-    const baseNext = apply !== null ? apply(atom.buffered) : value;
-    if (!atom.isEqual(atom.buffered, baseNext)) {
-      atom.buffered = baseNext;
+    const committedNext = apply !== null ? apply(atom.committedLatest) : value;
+    if (!atom.isEqual(atom.committedLatest, committedNext)) {
+      atom.committedLatest = committedNext;
       atom.flags |= F.Dirty;
-      mask |= PLANE_BASE;
-      baseChangeSeq = entrySeq !== 0 ? entrySeq : ++writeSeq;
-      headChangeSeq = baseChangeSeq;
+      mask |= PLANE_COMMITTED;
+      committedChangeSeq = writeSeq;
+      headChangeSeq = writeSeq;
     }
     if (forkCount > 0) {
-      const headNext = apply !== null ? apply(atom.headValue) : value;
-      if (!atom.isEqual(atom.headValue, headNext)) {
-        atom.headValue = headNext;
+      const headNext = apply !== null ? apply(atom.headLatest) : value;
+      if (!atom.isEqual(atom.headLatest, headNext)) {
+        atom.headLatest = headNext;
         atom.flags |= F.HeadDirty;
         mask |= PLANE_HEAD;
-        headChangeSeq = entrySeq !== 0 ? entrySeq : writeSeq;
+        headChangeSeq = writeSeq;
       }
     } else {
-      atom.headValue = atom.buffered;
+      atom.headLatest = atom.committedLatest;
     }
     if (mask !== 0 && atom.subs !== undefined) {
       propagate(atom.subs, forkCount > 0 ? mask : PLANE_BOTH, cycleGuard);
@@ -1513,79 +1560,63 @@ function appendLog(
   atom: AtomNode,
   value: unknown,
   apply: ((prev: unknown) => unknown) | null,
-  lane: number,
-  transition: boolean,
-): number {
+  batch: BatchRef,
+): void {
   if (atom.log === null || atom.log.length === 0) {
-    atom.preLogValue = baseAtomValue(atom);
+    atom.preLogValue = committedAtomValue(atom);
     if (atom.log === null) atom.log = [];
     loggedAtoms.add(atom);
   }
-  const seq = ++writeSeq;
-  atom.log.push({ value, apply, lane, seq, foldedAtSeq: 0, transition });
-  return seq;
+  atom.log.push({ value, apply, batch, seq: ++writeSeq, retiredAtSeq: 0 });
 }
 
 // ---------------------------------------------------------------------------
-// Fold: a React commit lands; pending writes join committed state
+// Retirement: a batch commits (or dies); its writes join committed state
 // ---------------------------------------------------------------------------
 
-export type FoldDecision = (entry: WriteEntry) => boolean;
-
 /**
- * Folds every pending log entry matching `shouldFold` into committed (BASE)
- * state. Called by the React bindings from the commit callback with "was this
- * entry's lane part of the committed lanes (or abandoned everywhere)?".
+ * Retires a batch: stamps its entries and recomputes each affected atom's
+ * COMMITTED view by replay — which rebases pending immediate updaters on top
+ * of the retired writes and makes rollback structurally impossible. Driven
+ * by the patch's onBatchRetired (exactly once per token). Uncommitted
+ * retirements (batches that never produced React work) retire the same way:
+ * the store is global; head state must converge on what was written.
  *
- * BASE is last-write-wins in *write* order: a fold never rolls the base value
- * back past a newer write that is already part of BASE (write-through urgent
- * writes, or entries folded earlier): BASE is recomputed by replaying the
- * log in write order, so updaters rebase and no fold can roll BASE backward.
- *
- * Fold-propagation runs on BASE and re-runs effect watchers (their committed
- * world changed); subscriptions are not marked — components were notified in
- * the writer's context and have either rendered these values or have the
- * update queued.
+ * Retirement-propagation re-runs effect watchers (their committed world
+ * changed) but mutes subscriptions — components were notified in the
+ * writer's context and have either rendered these values or have the render
+ * queued. When called from inside React's commit, `deferEffectFlush` lets
+ * the caller flush effects in a microtask instead; nothing else is held
+ * open, so post-commit synchronous writes keep their own delivery context.
  */
-export function fold(shouldFold: FoldDecision, deferEffectFlush = false): void {
+export function retireBatch(batch: BatchRef, deferEffectFlush = false): void {
   if (loggedAtoms.size === 0) return;
   const cause = tracer !== null ? setCurrentCause(tracer.emit('fold', currentCause)) : 0;
   const prevMuted = mutedSubscriptions;
   mutedSubscriptions = true;
   ++batchDepth;
   try {
+    const retiredStamp = ++writeSeq;
     for (const atom of loggedAtoms) {
       const log = atom.log;
       if (log === null) continue;
-      let anyNewlyFolded = false;
+      let any = false;
       for (let i = 0; i < log.length; i++) {
         const e = log[i]!;
-        if (e.foldedAtSeq === 0 && shouldFold(e)) {
-          e.foldedAtSeq = ++writeSeq;
-          if (e.transition) --forkCount;
-          anyNewlyFolded = true;
+        if (e.retiredAtSeq === 0 && e.batch === batch) {
+          e.retiredAtSeq = retiredStamp;
+          if (e.batch.deferred) --forkCount;
+          any = true;
         }
       }
-      if (anyNewlyFolded) {
-        // Recompute BASE by replaying, in write order, every entry that
-        // participates in it: folded entries plus still-pending urgent
-        // (write-through) entries. Replay — rather than taking the newest
-        // folded value — is what rebases pending urgent updaters on top of a
-        // just-committed transition, and what keeps an older transition's
-        // fold from rolling BASE back past a newer urgent write.
-        let next = atom.preLogValue;
-        for (let i = 0; i < log.length; i++) {
-          const e = log[i]!;
-          if (e.foldedAtSeq !== 0 || !e.transition) {
-            next = e.apply !== null ? e.apply(next) : e.value;
-          }
-        }
-        if (!atom.isEqual(atom.buffered, next)) {
-          atom.buffered = next;
+      if (any) {
+        const next = replayLog(atom, includesCommitted);
+        if (!atom.isEqual(atom.committedLatest, next)) {
+          atom.committedLatest = next;
           atom.flags |= F.Dirty;
-          baseChangeSeq = ++writeSeq;
+          committedChangeSeq = ++writeSeq;
           headChangeSeq = writeSeq;
-          if (atom.subs !== undefined) propagate(atom.subs, PLANE_BASE, undefined);
+          if (atom.subs !== undefined) propagate(atom.subs, PLANE_COMMITTED, undefined);
         }
       }
     }
@@ -1595,18 +1626,13 @@ export function fold(shouldFold: FoldDecision, deferEffectFlush = false): void {
     mutedSubscriptions = prevMuted;
     if (tracer !== null) setCurrentCause(cause);
   }
-  // A React commit calls fold from inside the commit phase; the caller defers
-  // the effect flush to a microtask so user effect code never runs mid-commit.
-  // Deferring must NOT hold the global batch open: post-commit synchronous
-  // writes (layout effects, event handlers) need their broadcasts delivered
-  // in their own context for lane attribution and loop protection.
   if (!deferEffectFlush) deliverNotifications();
 }
 
 /**
- * Drops folded log entries no active render pass can still need. A pinned
- * pass may still need the value *before* a folded entry, so the sweep bound
- * is the entry's fold time, not its write time.
+ * Drops retired log entries no active render pass can still need. A pinned
+ * pass may still need the value *before* a retired entry, so the sweep bound
+ * is the retirement ticket, not the write ticket.
  */
 function sweepLogs(): void {
   if (loggedAtoms.size === 0) return;
@@ -1620,9 +1646,9 @@ function sweepLogs(): void {
     let keepFrom = 0;
     while (keepFrom < log.length) {
       const e = log[keepFrom]!;
-      if (e.foldedAtSeq !== 0 && e.foldedAtSeq <= bound) {
-        // Collapse the entry into the pre-log value, replaying updaters so
-        // the collapsed prefix equals what any world would have computed.
+      if (e.retiredAtSeq !== 0 && e.retiredAtSeq <= bound) {
+        // Collapse into the replay base, replaying updaters so the collapsed
+        // prefix equals what any world would have computed.
         atom.preLogValue = e.apply !== null ? e.apply(atom.preLogValue) : e.value;
         keepFrom++;
       } else {
@@ -1637,7 +1663,7 @@ function sweepLogs(): void {
   }
 }
 
-/** True while any uncommitted transition write exists. Exposed for tests. */
+/** True while any unretired deferred write exists. Exposed for tests. */
 export function isForked(): boolean {
   return forkCount > 0;
 }
@@ -1690,7 +1716,9 @@ function runQueuedWatcher(w: WatcherNode): void {
   if (flags === F.None) return; // disposed while queued
   const dirty =
     (flags & F.Dirty) !== 0 ||
-    ((flags & F.Pending) !== 0 && w.deps !== undefined && checkDirty(w.deps, w, PLANE_BASE));
+    ((flags & F.Pending) !== 0 &&
+      w.deps !== undefined &&
+      checkDirty(w.deps, w, PLANE_COMMITTED));
   if (!dirty || w.flags === F.None) {
     // (w.flags check: the dirtiness pull's side effects may have disposed us.)
     if (w.flags !== F.None) {
@@ -1716,7 +1744,7 @@ export function runEffect(w: WatcherNode): void {
     }
     if (w.flags === F.None) return; // cleanup disposed the watcher
   }
-  const frame = startTracking(w, PLANE_BASE);
+  const frame = startTracking(w, PLANE_COMMITTED);
   w.flags |= F.Watching;
   ++evalDepth;
   const cause = tracer !== null ? setCurrentCause(tracer.emit('effect-run', currentCause, w)) : 0;
@@ -1725,7 +1753,7 @@ export function runEffect(w: WatcherNode): void {
     if (typeof result === 'function') w.cleanup = result;
   } finally {
     --evalDepth;
-    endTracking(w, frame, PLANE_BASE);
+    endTracking(w, frame, PLANE_COMMITTED);
     if (tracer !== null) setCurrentCause(cause);
   }
 }
@@ -1812,9 +1840,9 @@ export function createAtomNode(
     subs: undefined,
     subsTail: undefined,
     label: label ?? null,
-    value: initial,
-    buffered: initial,
-    headValue: initial,
+    committedValue: initial,
+    committedLatest: initial,
+    headLatest: initial,
     preLogValue: initial,
     log: null,
     isEqual: isEqual ?? Object.is,
@@ -1836,19 +1864,11 @@ export function createComputedNode(
     subs: undefined,
     subsTail: undefined,
     label: label ?? null,
-    value: undefined,
-    status: STATUS_VALUE,
-    payload: undefined,
-    headValue: undefined,
-    headStatus: STATUS_VALUE,
-    headPayload: undefined,
-    headGen: 0,
-    baseGen: 0,
-    evaluated: 0,
+    results: [],
+    committed: null,
     fn,
     isEqual: isEqual ?? Object.is,
     thenables: null,
     settleAttached: null,
-    renderCache: null,
   };
 }

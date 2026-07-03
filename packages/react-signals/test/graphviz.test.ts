@@ -1,15 +1,30 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { Atom, Computed, effect } from '../src/core/index.ts';
-import { setWriteLaneProvider, fold, isForked } from '../src/core/engine.ts';
+import {
+  setWriteBatchProvider,
+  retireBatch,
+  isForked,
+  type BatchRef,
+} from '../src/core/engine.ts';
 import { enableTracing, type TracingSession } from '../src/tracing/index.ts';
 import { dependencyGraphToDot, traceToDot } from '../src/graphviz/index.ts';
+
+// Fake batch token standing in for the patch's (an opaque BatchRef object).
+// Fresh per test so retirement state doesn't leak between tests.
+let T_BATCH: BatchRef;
+const createdTokens: BatchRef[] = [];
+beforeEach(() => {
+  T_BATCH = { deferred: true };
+  createdTokens.push(T_BATCH);
+});
 
 let session: TracingSession | null = null;
 afterEach(() => {
   session?.disable();
   session = null;
-  setWriteLaneProvider(null);
-  fold(() => true); // reconverge if a test left a fork open
+  setWriteBatchProvider(null);
+  // Reconverge if a test left a fork open.
+  for (const t of createdTokens.splice(0)) retireBatch(t);
 });
 
 describe('dependencyGraphToDot', () => {
@@ -54,15 +69,15 @@ describe('dependencyGraphToDot', () => {
       void c.state;
     });
 
-    setWriteLaneProvider(() => ({ lane: 2, transition: true }));
+    setWriteBatchProvider(() => T_BATCH);
     a.set(2); // fork; HEAD drops the b -> c edge on next head eval
-    setWriteLaneProvider(null);
+    setWriteBatchProvider(null);
     expect(isForked()).toBe(true);
     void a.state; // head read; re-evaluates c in HEAD without b
 
     const dot = dependencyGraphToDot([a, b]);
     expect(dot).toContain('forked');
-    expect(dot).toContain('BASE: 1 | HEAD: 2'); // atom a shows both planes
+    expect(dot).toContain('COMMITTED: 1 | HEAD: 2'); // atom a shows both planes
     expect(dot).toContain('log: 1 entries');
     dispose();
   });

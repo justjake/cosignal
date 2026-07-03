@@ -29,7 +29,7 @@ import {
   type WatcherNode,
   KIND_ATOM,
   WATCHER_SUBSCRIPTION,
-  PLANE_BASE,
+  PLANE_COMMITTED,
   PLANE_HEAD,
   createWatcher,
   subscribeTo,
@@ -82,7 +82,7 @@ export function useSignal<T>(signal: Atom<T> | Computed<T>): T {
     const equal = isEqual ?? Object.is;
     if (suspended === null) {
       try {
-        const base = peekNodeValue(node, PLANE_BASE);
+        const base = peekNodeValue(node, PLANE_COMMITTED);
         if (!equal(base, value)) {
           // Urgent divergence: correct before paint (sync lane here).
           forceUpdate();

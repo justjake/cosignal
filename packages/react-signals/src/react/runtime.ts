@@ -3,23 +3,25 @@
  * and the engine's world model:
  *
  * - render passes → RenderWorld objects (pinned views for consistent reads);
- * - writes → lane attribution via unstable_getCurrentUpdateLane;
- * - commits → fold pending writes into committed state and flush effects.
+ * - writes → batch tokens via unstable_getCurrentWriteBatch;
+ * - batch retirement → engine retirement (fold into committed state).
  *
- * Installed lazily the first time a hook subscribes. Everything is inert for
- * apps that never use the React bindings, and the engine stays plain-signals
- * (no write log, no forking) until a component actually subscribes.
+ * The protocol is entirely in terms of opaque batch tokens — no lane bits
+ * cross into userspace (see test/patch-contract.test.tsx for the contract).
+ * Installed lazily the first time a hook subscribes; the engine stays
+ * plain-signals until a component actually subscribes.
  */
 
 import * as React from 'react';
 import {
   type RenderWorld,
-  setWriteLaneProvider,
+  type BatchRef,
+  setWriteBatchProvider,
   setAmbientWorld,
   setRenderGuard,
   pinRenderPass,
   unpinRenderPass,
-  fold,
+  retireBatch,
   flushEffects,
   currentWriteSeq,
   config,
@@ -28,21 +30,20 @@ import { batch, wasExplicitlyConfigured } from '../core/api.ts';
 
 type PatchedReact = {
   unstable_subscribeToExternalRuntime(listener: {
-    onRenderPassStart?: (container: unknown, renderLanes: number) => void;
+    onRenderPassStart?: (container: unknown, includedBatches: readonly BatchRef[]) => void;
     onRenderPassEnd?: (container: unknown) => void;
-    onCommit?: (container: unknown, committedLanes: number, remainingLanes: number) => void;
+    onCommit?: (container: unknown) => void;
+    onBatchRetired?: (token: BatchRef, committed: boolean) => void;
   }): () => void;
   unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
-  unstable_getCurrentUpdateLane(): number;
-  unstable_isTransitionLane(lane: number): boolean;
-  unstable_lanesInclude(lanes: number, lane: number): boolean;
+  unstable_getCurrentWriteBatch(): BatchRef;
 };
 
 function patchedReact(): PatchedReact {
   const r = React as unknown as PatchedReact;
-  if (typeof r.unstable_subscribeToExternalRuntime !== 'function') {
+  if (typeof r.unstable_getCurrentWriteBatch !== 'function') {
     throw new Error(
-      'react-signals requires the patched React build (unstable_subscribeToExternalRuntime ' +
+      'react-signals requires the patched React build (unstable_getCurrentWriteBatch ' +
         'is missing). See scripts/build-react.sh.',
     );
   }
@@ -54,8 +55,8 @@ let installed = false;
 let consumerCount = 0;
 /** Render worlds for in-flight passes, keyed by root container. */
 const worldsByContainer = new Map<unknown, RenderWorld>();
-/** Last known pending lanes per container; drives abandoned-lane sweeping. */
-const pendingLanesByContainer = new Map<unknown, number>();
+
+const EMPTY_BATCHES: readonly BatchRef[] = [];
 
 export function addConsumer(): void {
   ensureInstalled();
@@ -64,11 +65,6 @@ export function addConsumer(): void {
 
 export function removeConsumer(): void {
   consumerCount--;
-  if (consumerCount === 0) {
-    // No React consumer is left; nothing will ever commit pending entries.
-    // Promote everything so the engine returns to steady state.
-    fold(() => true);
-  }
 }
 
 export function ensureInstalled(): void {
@@ -87,22 +83,19 @@ export function ensureInstalled(): void {
     config.throwOnUntrackedReadsInRender = true;
   }
 
-  setWriteLaneProvider(() => {
+  setWriteBatchProvider(() => {
     if (consumerCount === 0) return null;
-    const lane = R.unstable_getCurrentUpdateLane();
-    if (lane === 0) return null;
-    return { lane, transition: R.unstable_isTransitionLane(lane) };
+    return R.unstable_getCurrentWriteBatch();
   });
 
   R.unstable_subscribeToExternalRuntime({
-    onRenderPassStart(container, renderLanes) {
+    onRenderPassStart(container, includedBatches) {
       const previous = worldsByContainer.get(container);
       if (previous !== undefined) unpinRenderPass(previous.maxSeq);
       const world: RenderWorld = {
-        lanes: renderLanes,
+        includes: includedBatches,
         maxSeq: currentWriteSeq(),
-        laneIncluded: R.unstable_lanesInclude,
-        seesTransitions: null,
+        seesDeferred: null,
       };
       worldsByContainer.set(container, world);
       pinRenderPass(world.maxSeq);
@@ -114,22 +107,13 @@ export function ensureInstalled(): void {
         unpinRenderPass(world.maxSeq);
       }
     },
-    onCommit(container, committedLanes, remainingLanes) {
-      pendingLanesByContainer.set(container, remainingLanes);
-      // Fold entries whose lane just committed, plus entries whose lane is no
-      // longer pending in any root we know of (their subscribers unmounted or
-      // the work was superseded — the write still belongs in committed state).
-      // The fold's effect flush is deferred to a microtask so user effect
-      // code never runs inside React's commit phase; nothing else is held
-      // open — post-commit synchronous writes (layout effects, event
-      // handlers) deliver in their own context.
-      fold((entry) => {
-        if (R.unstable_lanesInclude(committedLanes, entry.lane)) return true;
-        for (const pending of pendingLanesByContainer.values()) {
-          if (R.unstable_lanesInclude(pending, entry.lane)) return false;
-        }
-        return true;
-      }, true);
+    onBatchRetired(token) {
+      // Exactly once per batch, at the moment React's own books change —
+      // commits and unmount-discarded work alike (see patch-contract tests).
+      // The effect flush is deferred to a microtask so user effect code never
+      // runs inside React's commit phase; nothing else is held open, so
+      // post-commit synchronous writes keep their own delivery context.
+      retireBatch(token, true);
       queueMicrotask(flushEffects);
     },
   });
@@ -137,7 +121,9 @@ export function ensureInstalled(): void {
 
 /**
  * The world for the render pass currently executing, if any. Falls back to
- * creating one on the fly when a pass began before the bindings installed.
+ * creating one on the fly when a pass began before the bindings installed
+ * (first-ever render); such a world can't know its included batches, which
+ * is harmless — no signal writes can predate the first subscription.
  */
 export function currentRenderWorld(): RenderWorld | null {
   if (!installed) return null;
@@ -145,12 +131,7 @@ export function currentRenderWorld(): RenderWorld | null {
   if (ctx === null) return null;
   let world = worldsByContainer.get(ctx.container);
   if (world === undefined) {
-    world = {
-      lanes: ctx.renderLanes,
-      maxSeq: currentWriteSeq(),
-      laneIncluded: patchedReact().unstable_lanesInclude,
-      seesTransitions: null,
-    };
+    world = { includes: EMPTY_BATCHES, maxSeq: currentWriteSeq(), seesDeferred: null };
     worldsByContainer.set(ctx.container, world);
     pinRenderPass(world.maxSeq);
   }
@@ -175,7 +156,7 @@ export function startTransitionSafe(fn: () => void): void {
 
 /**
  * startTransition + batch: signal writes inside `scope` ride the transition
- * lane AND coalesce into (at most) one notification per subscription instead
+ * batch AND coalesce into (at most) one notification per subscription instead
  * of one per write. Async scopes work like React's startTransition — the
  * batch covers the synchronous part; writes after an `await` need their own
  * startSignalTransition, the same rule React applies to setState.

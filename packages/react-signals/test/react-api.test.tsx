@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import * as React from 'react';
 import { act, startTransition, useReducer } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -15,14 +15,15 @@ import {
   startSignalTransition,
 } from '../src/index.ts';
 import {
-  setWriteLaneProvider,
-  fold,
+  setWriteBatchProvider,
+  retireBatch,
   setAmbientWorld,
   createWatcher,
   subscribeTo,
   disposeWatcher,
   WATCHER_SUBSCRIPTION,
   currentWriteSeq,
+  type BatchRef,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
@@ -44,8 +45,10 @@ afterEach(async () => {
     });
     el.remove();
   }
-  setWriteLaneProvider(null);
-  fold(() => true);
+  setWriteBatchProvider(null);
+  // Retire every fake token this test created so retirement state (fork
+  // count, atom logs) doesn't leak between tests.
+  for (const t of createdTokens.splice(0)) retireBatch(t);
 });
 
 function controlled(): { promise: Promise<void>; resolve: () => void } {
@@ -56,22 +59,30 @@ function controlled(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-const LANE_SYNC = 1;
-const LANE_T = 2;
-function makeWorld(lanes: number): RenderWorld {
+// Fake batch tokens standing in for the patch's (opaque BatchRef objects).
+// Fresh per test so retirement state doesn't leak between tests.
+let SYNC_BATCH: BatchRef;
+let T_BATCH: BatchRef;
+const createdTokens: BatchRef[] = [];
+beforeEach(() => {
+  SYNC_BATCH = { deferred: false };
+  T_BATCH = { deferred: true };
+  createdTokens.push(SYNC_BATCH, T_BATCH);
+});
+
+function makeWorld(includes: readonly BatchRef[]): RenderWorld {
   return {
-    lanes,
+    includes,
     maxSeq: currentWriteSeq(),
-    laneIncluded: (l, lane) => (l & lane) !== 0,
-    seesTransitions: null,
+    seesDeferred: null,
   };
 }
-function withLane<T>(lane: number, transition: boolean, fn: () => T): T {
-  setWriteLaneProvider(() => ({ lane, transition }));
+function withBatch<T>(token: BatchRef, fn: () => T): T {
+  setWriteBatchProvider(() => token);
   try {
     return fn();
   } finally {
-    setWriteLaneProvider(null);
+    setWriteBatchProvider(null);
   }
 }
 function readInWorld<T>(world: RenderWorld, fn: () => T): T {
@@ -86,43 +97,44 @@ function readInWorld<T>(world: RenderWorld, fn: () => T): T {
 describe('functional updates rebase like React setState (engine level)', () => {
   test('urgent updater interleaving a transition updater replays on both timelines', () => {
     const a = new Atom({ state: 1 });
-    // Subscribe so writes are logged (consumer gating is in the bindings;
-    // at engine level the lane provider is enough).
-    withLane(LANE_T, true, () => {
+    // The deferred write comes first, so the fork exists and the urgent
+    // write's log entry passes the observability gate (consumer gating is in
+    // the bindings; at engine level the batch provider is enough).
+    withBatch(T_BATCH, () => {
       a.update((x) => x + 1); // transition: +1
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.update((x) => x * 2); // urgent: *2, must apply to base 1 NOW
     });
 
     // Urgent world: transition excluded → 1 * 2 = 2.
-    expect(readInWorld(makeWorld(LANE_SYNC), () => a.state)).toBe(2);
+    expect(readInWorld(makeWorld([SYNC_BATCH]), () => a.state)).toBe(2);
     // Head (both applied in write order): (1 + 1) * 2 = 4.
     expect(a.state).toBe(4);
 
-    // Urgent commit folds first: committed = 2.
-    fold((e) => (e.lane & LANE_SYNC) !== 0);
-    expect(readInWorld(makeWorld(LANE_SYNC), () => a.state)).toBe(2);
+    // Urgent commit retires first: committed = 2.
+    retireBatch(SYNC_BATCH);
+    expect(readInWorld(makeWorld([SYNC_BATCH]), () => a.state)).toBe(2);
 
     // Transition commits: its +1 lands FIRST in write order, and the urgent
     // *2 REPLAYS on top — committed becomes (1+1)*2 = 4, not 2 and not 3.
-    fold(() => true);
-    expect(readInWorld(makeWorld(LANE_SYNC), () => a.state)).toBe(4);
+    retireBatch(T_BATCH);
+    expect(readInWorld(makeWorld([SYNC_BATCH]), () => a.state)).toBe(4);
     expect(a.state).toBe(4);
   });
 
   test('an older transition fold cannot roll back or clobber newer updates', () => {
     const a = new Atom({ state: 1 });
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(10);
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.update((x) => x + 1); // applies to 1 → committed 2
     });
-    expect(readInWorld(makeWorld(LANE_SYNC), () => a.state)).toBe(2);
-    fold((e) => (e.lane & LANE_SYNC) !== 0);
-    // Transition folds after: set 10, then the +1 replays on top → 11.
-    fold(() => true);
+    expect(readInWorld(makeWorld([SYNC_BATCH]), () => a.state)).toBe(2);
+    retireBatch(SYNC_BATCH);
+    // Transition retires after: set 10, then the +1 replays on top → 11.
+    retireBatch(T_BATCH);
     expect(a.state).toBe(11);
   });
 
@@ -131,16 +143,16 @@ describe('functional updates rebase like React setState (engine level)', () => {
       state: 1,
       reduce: (s, action) => (action === 'inc' ? s + 1 : s * 2),
     });
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       counter.dispatch('inc');
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       counter.dispatch('double');
     });
-    expect(readInWorld(makeWorld(LANE_SYNC), () => counter.state)).toBe(2);
+    expect(readInWorld(makeWorld([SYNC_BATCH]), () => counter.state)).toBe(2);
     expect(counter.state).toBe(4); // head
-    fold((e) => (e.lane & LANE_SYNC) !== 0);
-    fold(() => true);
+    retireBatch(SYNC_BATCH);
+    retireBatch(T_BATCH);
     expect(counter.state).toBe(4); // (1+1)*2, matching useReducer
   });
 });
@@ -238,13 +250,13 @@ describe('batching and startSignalTransition', () => {
       notifies++;
     });
     subscribeTo(w, sum.node);
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.set(2);
       b.set(2);
     });
     expect(notifies).toBe(2); // unbatched: one per write
 
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       batch(() => {
         a.set(3);
         b.set(3);

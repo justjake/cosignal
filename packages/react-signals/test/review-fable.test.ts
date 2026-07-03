@@ -5,51 +5,60 @@
  * engine's own doc comments. Tests marked `test.fails` currently fail —
  * each one is a confirmed defect. See the review report for explanations.
  */
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { Atom, Computed, effect } from '../src/core/index.ts';
 import {
-  setWriteLaneProvider,
+  setWriteBatchProvider,
   setAmbientWorld,
   pinRenderPass,
   unpinRenderPass,
-  fold,
+  retireBatch,
   isForked,
   currentWriteSeq,
   createWatcher,
   subscribeTo,
   WATCHER_SUBSCRIPTION,
+  type BatchRef,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
-const LANE_SYNC = 1;
-const LANE_T = 2;
-const LANE_T2 = 4;
+// Fake batch tokens standing in for the patch's (opaque BatchRef objects).
+// Fresh per test so retirement state doesn't leak between tests.
+let SYNC_BATCH: BatchRef;
+let T_BATCH: BatchRef;
+let T2_BATCH: BatchRef;
+const createdTokens: BatchRef[] = [];
+beforeEach(() => {
+  SYNC_BATCH = { deferred: false };
+  T_BATCH = { deferred: true };
+  T2_BATCH = { deferred: true };
+  createdTokens.push(SYNC_BATCH, T_BATCH, T2_BATCH);
+});
 
-function makeWorld(lanes: number, maxSeq: number): RenderWorld {
+function makeWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
   return {
-    lanes,
+    includes,
     maxSeq,
-    laneIncluded: (worldLanes, lane) => (worldLanes & lane) !== 0,
-    seesTransitions: null,
+    seesDeferred: null,
   };
 }
 
-function withLane<T>(lane: number, transition: boolean, fn: () => T): T {
-  setWriteLaneProvider(() => ({ lane, transition }));
+function withBatch<T>(token: BatchRef, fn: () => T): T {
+  setWriteBatchProvider(() => token);
   try {
     return fn();
   } finally {
-    setWriteLaneProvider(null);
+    setWriteBatchProvider(null);
   }
 }
 
 // The engine keeps module-level state (forkCount, loggedAtoms, writeSeq).
 // Reconverge the planes after every test so tests don't contaminate each
-// other: fold everything and clear providers/worlds.
+// other: retire every batch the test created and clear providers/worlds.
 afterEach(() => {
-  setWriteLaneProvider(null);
+  setWriteBatchProvider(null);
   setAmbientWorld(null);
-  fold(() => true);
+  for (const t of createdTokens.splice(0)) retireBatch(t);
   expect(isForked()).toBe(false);
 });
 
@@ -74,36 +83,36 @@ describe('review: fold ordering', () => {
   // fold call). Folding the sync lane first (React's normal commit order:
   // sync commit, then transition commit) and the transition lane second
   // rolls the committed value BACK to the older transition write.
-  test('A: transition fold must not clobber a later urgent write (fold sync, then fold transition)', () => {
+  test('A: transition retirement must not clobber a later urgent write (retire sync, then retire transition)', () => {
     const a = new Atom({ state: 1 });
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2); // transition write, seq 1
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.set(3); // urgent write, seq 2 — write-through to BASE
     });
     expect(a.state).toBe(3); // head: last write wins
 
-    fold((e) => e.lane === LANE_SYNC); // sync lane commits first (normal order)
-    fold((e) => e.lane === LANE_T); // transition commits second
+    retireBatch(SYNC_BATCH); // sync batch commits first (normal order)
+    retireBatch(T_BATCH); // transition commits second
     expect(isForked()).toBe(false);
 
     // Last write wins: committed value must be 3. Actual: 2.
     expect(a.state).toBe(3);
   });
 
-  // Same root cause, two transition lanes folded newest-first.
-  test('A2: folding an older transition lane after a newer one rolls the value back', () => {
+  // Same root cause, two transition batches retired newest-first.
+  test('A2: retiring an older transition batch after a newer one rolls the value back', () => {
     const a = new Atom({ state: 1 });
-    withLane(LANE_T, true, () => {
-      a.set(2); // lane T, seq 1
+    withBatch(T_BATCH, () => {
+      a.set(2); // batch T, seq 1
     });
-    withLane(LANE_T2, true, () => {
-      a.set(3); // lane T2, seq 2
+    withBatch(T2_BATCH, () => {
+      a.set(3); // batch T2, seq 2
     });
-    fold((e) => e.lane === LANE_T2);
+    retireBatch(T2_BATCH);
     expect(a.state).toBe(3); // ok so far (untracked read; still forked with T pending)
-    fold((e) => e.lane === LANE_T);
+    retireBatch(T_BATCH);
     expect(isForked()).toBe(false);
     expect(a.state).toBe(3); // actual: 2
   });
@@ -124,7 +133,7 @@ describe('review: head plane seeding', () => {
 
     a.set(2); // steady-state write; c stays lazily stale (Pending)
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       z.set(1); // unrelated transition write → fork
     });
 
@@ -141,22 +150,22 @@ describe('review: render-world fast paths', () => {
   // sees two different values for the same state (tear). The computed must
   // "participate" in the graph for the fast path (evaluated once / subscribed
   // — the normal case for a useSignal'd computed).
-  test('C: transition world must not see an unfolded urgent write via the computed fast path', () => {
+  test('C: transition world must not see an unretired urgent write via the computed fast path', () => {
     const a = new Atom({ state: 1 });
     const b = new Atom({ state: 10 });
     const cb = new Computed({ fn: () => b.state });
     expect(cb.state).toBe(10); // participate: evaluated once, deps exist
-    withLane(LANE_T, true, () => {
-      a.set(2); // fork; makes the world "see transitions"
+    withBatch(T_BATCH, () => {
+      a.set(2); // fork; makes the world "see deferred batches"
     });
-    withLane(LANE_SYNC, false, () => {
-      b.set(11); // urgent write, unfolded, lane NOT in the world below
+    withBatch(SYNC_BATCH, () => {
+      b.set(11); // urgent write, unretired, batch NOT in the world below
     });
-    const world = makeWorld(LANE_T, currentWriteSeq());
+    const world = makeWorld([T_BATCH], currentWriteSeq());
     const prev = setAmbientWorld(world);
     try {
-      const atomView = b.state; // 10: unfolded urgent entry excluded by lane
-      const computedView = cb.state; // actual 11: HEAD fast path includes it
+      const atomView = b.state; // 10: unretired urgent entry excluded by batch
+      const computedView = cb.state; // 11 if the HEAD fast path includes it
       expect(computedView).toBe(atomView);
       expect(computedView).toBe(10);
     } finally {
@@ -168,20 +177,29 @@ describe('review: render-world fast paths', () => {
   // fast path is taken without checking anyUnfoldedUrgentEntries(), so a
   // world whose lanes exclude a pending urgent/default-priority write reads
   // it anyway through computeds (but not through atoms).
-  test('D: non-forked world excluding an unfolded urgent lane must not see it via computeds', () => {
+  test('D: non-forked world excluding an unretired urgent batch must not see it via computeds', () => {
     const b = new Atom({ state: 10 });
     const cb = new Computed({ fn: () => b.state });
     expect(cb.state).toBe(10); // participate: evaluated once, deps exist
-    withLane(LANE_SYNC, false, () => {
-      b.set(11); // logged urgent entry, unfolded
-    });
-    const world = makeWorld(LANE_T, currentWriteSeq()); // lanes exclude LANE_SYNC
-    const prev = setAmbientWorld(world);
+    // Observability gate: an immediate write is only logged while forked or
+    // while a render pass is pinned — pin one first (worlds only exist during
+    // pinned passes anyway), preserving the "logged but excluded" scenario.
+    const pin = currentWriteSeq();
+    pinRenderPass(pin);
     try {
-      expect(b.state).toBe(10); // atom read: excluded (passes)
-      expect(cb.state).toBe(10); // actual 11 via BASE fast path
+      withBatch(SYNC_BATCH, () => {
+        b.set(11); // logged urgent entry, unretired
+      });
+      const world = makeWorld([T_BATCH], currentWriteSeq()); // excludes SYNC_BATCH
+      const prev = setAmbientWorld(world);
+      try {
+        expect(b.state).toBe(10); // atom read: excluded (passes)
+        expect(cb.state).toBe(10); // 11 if read via the BASE fast path
+      } finally {
+        setAmbientWorld(prev);
+      }
     } finally {
-      setAmbientWorld(prev);
+      unpinRenderPass(pin);
     }
   });
 });
@@ -193,14 +211,14 @@ describe('review: pinned render passes vs fold', () => {
   // sweepLogs drops the folded entry into preLogValue because its *write*
   // seq is <= the pin, even though the pass had excluded it by lane.
   // The pin was supposed to isolate the pass ("epoch pinning", DESIGN §2).
-  test('E: a fold while a pass is pinned must not change the pass’s reads', () => {
+  test('E: a retirement while a pass is pinned must not change the pass’s reads', () => {
     const a = new Atom({ state: 1 });
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2);
     });
     const pin = currentWriteSeq();
     pinRenderPass(pin);
-    const world = makeWorld(LANE_SYNC, pin); // urgent pass; excludes the transition
+    const world = makeWorld([SYNC_BATCH], pin); // urgent pass; excludes the transition
     try {
       let prev = setAmbientWorld(world);
       let first: unknown;
@@ -211,7 +229,7 @@ describe('review: pinned render passes vs fold', () => {
       }
       expect(first).toBe(1);
 
-      fold((e) => e.lane === LANE_T); // another root commits mid-pass
+      retireBatch(T_BATCH); // another root commits mid-pass
 
       prev = setAmbientWorld(world);
       let second: unknown;
@@ -286,13 +304,13 @@ describe('review: subscription notifications', () => {
     });
     subscribeTo(w, c.node);
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       t.set(1); // fork; head c: 0→1 → notify fires
     });
     const before = notifies;
     expect(before).toBeGreaterThan(0);
 
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.set(1); // BASE c: 0→1 (urgent world changed!); HEAD c: 1→1 (cutoff)
     });
     expect(notifies).toBeGreaterThan(before); // actual: unchanged — swallowed
@@ -300,19 +318,22 @@ describe('review: subscription notifications', () => {
 });
 
 describe('review: sanity checks that pass (kept as regression guards)', () => {
-  test('fold of both lanes in one call keeps last-write-wins', () => {
+  test('retiring both batches keeps last-write-wins', () => {
     const a = new Atom({ state: 1 });
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2);
     });
-    withLane(LANE_SYNC, false, () => {
+    withBatch(SYNC_BATCH, () => {
       a.set(3);
     });
-    fold(() => true); // single fold call folds in log order
+    // Retirement recomputes committed state by replaying the log in write
+    // order, regardless of retirement order.
+    retireBatch(T_BATCH);
+    retireBatch(SYNC_BATCH);
     expect(a.state).toBe(3);
   });
 
-  test('effects run exactly once per fold touching multiple atoms', () => {
+  test('effects run exactly once per retirement touching multiple atoms', () => {
     const a = new Atom({ state: 1 });
     const b = new Atom({ state: 1 });
     let runs = 0;
@@ -322,12 +343,12 @@ describe('review: sanity checks that pass (kept as regression guards)', () => {
       runs++;
     });
     expect(runs).toBe(1);
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(2);
       b.set(2);
     });
     expect(runs).toBe(1); // pending transition: not yet
-    fold((e) => e.lane === LANE_T);
-    expect(runs).toBe(2); // exactly once for the whole fold
+    retireBatch(T_BATCH);
+    expect(runs).toBe(2); // exactly once for the whole retirement
   });
 });

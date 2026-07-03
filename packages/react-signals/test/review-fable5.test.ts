@@ -7,35 +7,44 @@
  * fails, demonstrating a confirmed defect. Findings here are disjoint from
  * review-fable.test.ts and review-claude.test.ts.
  */
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { Atom, Computed, effect } from '../src/core/index.ts';
 import {
-  setWriteLaneProvider,
+  setWriteBatchProvider,
   setAmbientWorld,
-  fold,
+  retireBatch,
   isForked,
   createWatcher,
   subscribeTo,
   disposeWatcher,
   writeAtom,
   WATCHER_SUBSCRIPTION,
+  type BatchRef,
 } from '../src/core/engine.ts';
 
-const LANE_T = 2;
+// Fake batch token standing in for the patch's (an opaque BatchRef object).
+// Fresh per test so retirement state doesn't leak between tests.
+let T_BATCH: BatchRef;
+const createdTokens: BatchRef[] = [];
+beforeEach(() => {
+  T_BATCH = { deferred: true };
+  createdTokens.push(T_BATCH);
+});
 
-function withLane<T>(lane: number, transition: boolean, fn: () => T): T {
-  setWriteLaneProvider(() => ({ lane, transition }));
+function withBatch<T>(token: BatchRef, fn: () => T): T {
+  setWriteBatchProvider(() => token);
   try {
     return fn();
   } finally {
-    setWriteLaneProvider(null);
+    setWriteBatchProvider(null);
   }
 }
 
 afterEach(() => {
-  setWriteLaneProvider(null);
+  setWriteBatchProvider(null);
   setAmbientWorld(null);
-  fold(() => true); // unfork / drain logs so tests stay independent
+  // Unfork / drain logs so tests stay independent.
+  for (const t of createdTokens.splice(0)) retireBatch(t);
 });
 
 // ---------------------------------------------------------------------------
@@ -145,7 +154,7 @@ describe('finding 3: stale HeadPending prunes HEAD propagation after fork', () =
     const d = new Computed({ fn: () => c.state + 1 });
     expect(d.state).toBe(21); // BASE pull clears c's Pending; HeadPending survives
 
-    withLane(LANE_T, true, () => {
+    withBatch(T_BATCH, () => {
       a.set(3); // HEAD propagate prunes at c → d never marked HeadPending
     });
     expect(isForked()).toBe(true);
@@ -164,7 +173,7 @@ describe('finding 3: stale HeadPending prunes HEAD propagation after fork', () =
     const s = createWatcher(WATCHER_SUBSCRIPTION, null, () => void notifies++);
     subscribeTo(s, c.node);
     try {
-      withLane(LANE_T, true, () => {
+      withBatch(T_BATCH, () => {
         a.set(3); // genuine head change 20→30; propagate prunes at c
       });
       expect(notifies).toBeGreaterThan(0); // FAILS: 0 — component never re-renders

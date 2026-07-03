@@ -30,8 +30,10 @@ import {
   KIND_ATOM,
   KIND_COMPUTED,
   WATCHER_EFFECT,
-  PLANE_BASE,
+  PLANE_COMMITTED,
   PLANE_HEAD,
+  WORLD_COMMITTED,
+  WORLD_HEAD,
   STATUS_ERROR,
   STATUS_SUSPENDED,
   F,
@@ -177,9 +179,9 @@ function nodeAttrs(node: Node, forked: boolean): string {
     const atom = node as AtomNode;
     let valueLine: string;
     if (forked) {
-      valueLine = `BASE: ${summarize(atom.buffered)} | HEAD: ${summarize(atom.headValue)}`;
+      valueLine = `COMMITTED: ${summarize(atom.committedLatest)} | HEAD: ${summarize(atom.headLatest)}`;
     } else {
-      valueLine = summarize(atom.buffered);
+      valueLine = summarize(atom.committedLatest);
     }
     const pendingLog =
       atom.log !== null && atom.log.length > 0 ? `\nlog: ${atom.log.length} entries` : '';
@@ -188,9 +190,18 @@ function nodeAttrs(node: Node, forked: boolean): string {
   }
   if (node.kind === KIND_COMPUTED) {
     const c = node as ComputedNode;
-    let valueLine = computedResult(c.status, c.value, c.payload);
+    const committed = c.results.find((r) => r.world === WORLD_COMMITTED);
+    let valueLine =
+      committed !== undefined
+        ? computedResult(committed.status, committed.value, committed.payload)
+        : '(not yet evaluated)';
     if (forked) {
-      valueLine = `BASE: ${valueLine} | HEAD: ${computedResult(c.headStatus, c.headValue, c.headPayload)}`;
+      const head = c.results.find((r) => r.world === WORLD_HEAD);
+      valueLine = `COMMITTED: ${valueLine} | HEAD: ${
+        head !== undefined
+          ? computedResult(head.status, head.value, head.payload)
+          : '(not seeded)'
+      }`;
     }
     const label = `${nodeDisplayName(node)}\n${valueLine}${flagMarkers(node)}`;
     return `[shape=ellipse, style=filled, fillcolor="#dcfce7", label="${q(label)}"]`;
@@ -200,11 +211,11 @@ function nodeAttrs(node: Node, forked: boolean): string {
 }
 
 function edgeAttrs(link: Link, forked: boolean): string {
-  if (!forked || link.planes === (PLANE_BASE | PLANE_HEAD)) {
+  if (!forked || link.planes === (PLANE_COMMITTED | PLANE_HEAD)) {
     return '[color="#6b7280"]';
   }
-  if ((link.planes & PLANE_BASE) !== 0) {
-    return '[color="#2563eb", label="BASE"]';
+  if ((link.planes & PLANE_COMMITTED) !== 0) {
+    return '[color="#2563eb", label="COMMITTED"]';
   }
   if ((link.planes & PLANE_HEAD) !== 0) {
     return '[color="#ea580c", style=dashed, label="HEAD"]';
