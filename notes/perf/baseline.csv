@@ -1,65 +1,65 @@
-react-signals,avoidablePropagation,198.95
-react-signals,broadPropagation,172.66
-react-signals,deepPropagation,80.47
-react-signals,diamond,172.19
-react-signals,mux,191.43
-react-signals,repeatedObservers,21.98
-react-signals,triangle,51.04
-react-signals,unstable,45.25
-react-signals,molBench,270.52
-react-signals,createDataSignals,13.32
-react-signals,createComputations0to1,2.11
-react-signals,createComputations1to1,6.58
-react-signals,createComputations2to1,5.72
-react-signals,createComputations4to1,4.97
-react-signals,createComputations1000to1,3.07
-react-signals,createComputations1to2,9.89
-react-signals,createComputations1to4,5.3
-react-signals,createComputations1to8,2.36
-react-signals,createComputations1to1000,2.53
-react-signals,updateComputations1to1,2.97
-react-signals,updateComputations2to1,1.82
-react-signals,updateComputations4to1,1.18
-react-signals,updateComputations1000to1,0.74
-react-signals,updateComputations1to2,2.22
-react-signals,updateComputations1to4,1.25
-react-signals,updateComputations1to1000,0.64
-react-signals,10x5 - 2 sources - read 20% (simple component),137.82
-react-signals,10x10 - 6 sources - dynamic - read 20% (dynamic component),143.58
-react-signals,1000x12 - 4 sources - dynamic (large web app),320.7
-react-signals,1000x5 - 25 sources (wide dense),421.33
-react-signals,5x500 - 3 sources (deep),120.86
-react-signals (forked),avoidablePropagation,223.55
-react-signals (forked),broadPropagation,243.42
-react-signals (forked),deepPropagation,175.23
-react-signals (forked),diamond,322.3
-react-signals (forked),mux,86.4
-react-signals (forked),repeatedObservers,50.84
-react-signals (forked),triangle,108.14
-react-signals (forked),unstable,60.86
-react-signals (forked),molBench,273.39
-react-signals (forked),createDataSignals,13.59
-react-signals (forked),createComputations0to1,2.07
-react-signals (forked),createComputations1to1,7.28
-react-signals (forked),createComputations2to1,5.66
-react-signals (forked),createComputations4to1,3.65
-react-signals (forked),createComputations1000to1,3.12
-react-signals (forked),createComputations1to2,9.25
-react-signals (forked),createComputations1to4,6.24
-react-signals (forked),createComputations1to8,4.03
-react-signals (forked),createComputations1to1000,2.31
-react-signals (forked),updateComputations1to1,3.36
-react-signals (forked),updateComputations2to1,2.44
-react-signals (forked),updateComputations4to1,1.43
-react-signals (forked),updateComputations1000to1,0.73
-react-signals (forked),updateComputations1to2,2.16
-react-signals (forked),updateComputations1to4,1.46
-react-signals (forked),updateComputations1to1000,0.72
-react-signals (forked),10x5 - 2 sources - read 20% (simple component),187.87
-react-signals (forked),10x10 - 6 sources - dynamic - read 20% (dynamic component),172.46
-react-signals (forked),1000x12 - 4 sources - dynamic (large web app),365.81
-react-signals (forked),1000x5 - 25 sources (wide dense),504.07
-react-signals (forked),5x500 - 3 sources (deep),137.98
+cosignal,avoidablePropagation,198.95
+cosignal,broadPropagation,172.66
+cosignal,deepPropagation,80.47
+cosignal,diamond,172.19
+cosignal,mux,191.43
+cosignal,repeatedObservers,21.98
+cosignal,triangle,51.04
+cosignal,unstable,45.25
+cosignal,molBench,270.52
+cosignal,createDataSignals,13.32
+cosignal,createComputations0to1,2.11
+cosignal,createComputations1to1,6.58
+cosignal,createComputations2to1,5.72
+cosignal,createComputations4to1,4.97
+cosignal,createComputations1000to1,3.07
+cosignal,createComputations1to2,9.89
+cosignal,createComputations1to4,5.3
+cosignal,createComputations1to8,2.36
+cosignal,createComputations1to1000,2.53
+cosignal,updateComputations1to1,2.97
+cosignal,updateComputations2to1,1.82
+cosignal,updateComputations4to1,1.18
+cosignal,updateComputations1000to1,0.74
+cosignal,updateComputations1to2,2.22
+cosignal,updateComputations1to4,1.25
+cosignal,updateComputations1to1000,0.64
+cosignal,10x5 - 2 sources - read 20% (simple component),137.82
+cosignal,10x10 - 6 sources - dynamic - read 20% (dynamic component),143.58
+cosignal,1000x12 - 4 sources - dynamic (large web app),320.7
+cosignal,1000x5 - 25 sources (wide dense),421.33
+cosignal,5x500 - 3 sources (deep),120.86
+cosignal (forked),avoidablePropagation,223.55
+cosignal (forked),broadPropagation,243.42
+cosignal (forked),deepPropagation,175.23
+cosignal (forked),diamond,322.3
+cosignal (forked),mux,86.4
+cosignal (forked),repeatedObservers,50.84
+cosignal (forked),triangle,108.14
+cosignal (forked),unstable,60.86
+cosignal (forked),molBench,273.39
+cosignal (forked),createDataSignals,13.59
+cosignal (forked),createComputations0to1,2.07
+cosignal (forked),createComputations1to1,7.28
+cosignal (forked),createComputations2to1,5.66
+cosignal (forked),createComputations4to1,3.65
+cosignal (forked),createComputations1000to1,3.12
+cosignal (forked),createComputations1to2,9.25
+cosignal (forked),createComputations1to4,6.24
+cosignal (forked),createComputations1to8,4.03
+cosignal (forked),createComputations1to1000,2.31
+cosignal (forked),updateComputations1to1,3.36
+cosignal (forked),updateComputations2to1,2.44
+cosignal (forked),updateComputations4to1,1.43
+cosignal (forked),updateComputations1000to1,0.73
+cosignal (forked),updateComputations1to2,2.16
+cosignal (forked),updateComputations1to4,1.46
+cosignal (forked),updateComputations1to1000,0.72
+cosignal (forked),10x5 - 2 sources - read 20% (simple component),187.87
+cosignal (forked),10x10 - 6 sources - dynamic - read 20% (dynamic component),172.46
+cosignal (forked),1000x12 - 4 sources - dynamic (large web app),365.81
+cosignal (forked),1000x5 - 25 sources (wide dense),504.07
+cosignal (forked),5x500 - 3 sources (deep),137.98
 alien-signals,avoidablePropagation,149.54
 alien-signals,broadPropagation,106.91
 alien-signals,deepPropagation,45.7

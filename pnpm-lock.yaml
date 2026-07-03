@@ -20,7 +20,7 @@ importers:
         specifier: ^3.9.4
         version: 3.9.4
 
-  packages/react-signals:
+  packages/cosignal:
     dependencies:
       react:
         specifier: link:../../vendor/react/build/oss-experimental/react

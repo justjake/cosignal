@@ -18,8 +18,16 @@ cd "$(dirname "$0")/../vendor/react"
 
 ENTRIES="react/index,react/jsx,react/compiler-runtime,react-dom/index,react-dom/client,react-dom/test-utils,scheduler"
 
-RELEASE_CHANNEL=experimental mise exec node@20.19.0 -- \
-  node ./scripts/rollup/build.js "$ENTRIES" --type=NODE_DEV,NODE_PROD
+# Locally, pin the node version React's own CI uses (.nvmrc) via mise; in CI
+# (or anywhere without mise) use whatever node is on PATH.
+if command -v mise >/dev/null 2>&1; then
+  NODE_RUNNER=(mise exec "node@$(tr -d 'v[:space:]' <.nvmrc)" -- node)
+else
+  NODE_RUNNER=(node)
+fi
+
+RELEASE_CHANNEL=experimental "${NODE_RUNNER[@]}" \
+  ./scripts/rollup/build.js "$ENTRIES" --type=NODE_DEV,NODE_PROD
 
 rm -rf build/oss-experimental
 mv build/node_modules build/oss-experimental

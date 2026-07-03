@@ -1,4 +1,4 @@
-# react-signals — Design
+# cosignal — Design
 
 A signals library for React with first-class concurrent rendering support:
 no `useSyncExternalStore`, full `startTransition` integration, Suspense parity,
@@ -289,7 +289,7 @@ Server rendering reads committed values with no subscriptions and no atom
 serialize atom state and initialize atoms before `hydrateRoot` (documented
 recipe + helper). No `getServerSnapshot` analogue needed — reads are plain.
 
-## 5. Tracing (`react-signals/tracing`, lazy)
+## 5. Tracing (`cosignal/tracing`, lazy)
 
 Event schema with causality: every event has `id`, `time`, `cause` (id of the
 triggering event) and a type-specific payload — `atom-write`, `computed-eval`,
@@ -300,7 +300,7 @@ devtools timeline; helpers answer "why did X re-run" by walking cause chains.
 Zero overhead unless loaded (single null check per site).
 
 Two visualizer helpers live in a further-separate module,
-`react-signals/graphviz`, which emits Graphviz DOT source (render it with
+`cosignal/graphviz`, which emits Graphviz DOT source (render it with
 `dot -Tsvg` or any Graphviz viewer — DOT handles graph sizes that crash
 Mermaid renderers):
 
@@ -411,7 +411,7 @@ the bracket to cover them.
 This section re-explains the machinery above in plain language, following one
 computed through its life. It adds no new rules — everything here is §2 and §3
 again, slower and with pictures. Code references are into
-`packages/react-signals/src/core/engine.ts`.
+`packages/cosignal/src/core/engine.ts`.
 
 ### 9.1 A computed is a cache with sticky notes
 
@@ -662,7 +662,7 @@ to shared derived state.
 
 ### 9.10 Seeing it live
 
-`react-signals/graphviz` renders both halves of this story from a running
+`cosignal/graphviz` renders both halves of this story from a running
 app: `dependencyGraphToDot` snapshots the graph (per-plane values, stale
 flags, per-plane edges), and `traceToDot` turns a tracing session's events
 into the causal chain a write followed. See §5.

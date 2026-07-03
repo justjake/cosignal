@@ -1,11 +1,11 @@
 /**
- * react-signals — concurrent-safe signals for React.
+ * cosignal — concurrent-safe signals for React.
  *
  * Core (framework-agnostic) surface re-exported from ./core; React hooks from
  * ./react. getInstrumentedReact exposes the instrumented React build's add-on
  * surface (typed) for integrations beyond signals, e.g. MutationObservers
  * that ignore React's commits. The lazy tracing module lives at
- * `react-signals/tracing`.
+ * `cosignal/tracing`.
  */
 
 export {

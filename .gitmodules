@@ -1,6 +1,6 @@
 [submodule "vendor/react"]
 	path = vendor/react
-	url = https://github.com/react/react
+	url = https://github.com/justjake/react.git
 [submodule "vendor/alien-signals"]
 	path = vendor/alien-signals
 	url = https://github.com/stackblitz/alien-signals

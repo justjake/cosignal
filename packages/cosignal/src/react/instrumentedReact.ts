@@ -1,7 +1,7 @@
 /**
  * The instrumented React build's add-on surface, typed.
  *
- * react-signals requires a React built with concurrency instrumentation
+ * cosignal requires a React built with concurrency instrumentation
  * (vendor/react branch `react-signals-patch`, built by scripts/build-react.sh):
  * lifecycle events and scheduling queries that let external state coordinate
  * with concurrent rendering — render-pass brackets with included batch
@@ -62,7 +62,7 @@ export function getInstrumentedReact(): InstrumentedReact {
   const r = React as unknown as InstrumentedReact;
   if (typeof r.unstable_getCurrentWriteBatch !== 'function') {
     throw new Error(
-      'react-signals requires an instrumented React build (unstable_getCurrentWriteBatch ' +
+      'cosignal requires an instrumented React build (unstable_getCurrentWriteBatch ' +
         'is missing). See scripts/build-react.sh.',
     );
   }

@@ -1,5 +1,5 @@
 /**
- * react-signals/tracing — lazy-loadable causality tracing.
+ * cosignal/tracing — lazy-loadable causality tracing.
  *
  * Nothing in this module is imported by the core or the React bindings; until
  * an app imports it and calls enableTracing(), every trace site in the engine

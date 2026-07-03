@@ -2,7 +2,7 @@
  * Tracing hook slot.
  *
  * The core emits events through `tracer` when (and only when) a tracer is
- * installed by the lazy `react-signals/tracing` module. Every emit site is
+ * installed by the lazy `cosignal/tracing` module. Every emit site is
  * guarded by a null check, so the cost of tracing when disabled is one
  * comparison. Do not import the tracing module from core code.
  *

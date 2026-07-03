@@ -1,0 +1,241 @@
+name: NPM Release
+
+# Build the patched React fork + cosignal, test, pack tarballs, smoke-test
+# them npm-only, and publish via npm trusted publishing (OIDC — no tokens).
+#
+# - push to main:        publish cosignal@<src>-nightly-<sha> under dist-tag `experimental`
+# - workflow_dispatch:   nightly (as above) or stable (cosignal@<src>, dist-tag `latest`)
+# - pull_request:        build, test, pack, smoke only — never publishes
+#
+# Fork versions are stamped from the cosignal version: @jitl/react@19.3.0-cosignal.<version>.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Release type"
+        required: true
+        default: "nightly"
+        type: choice
+        options:
+          - nightly
+          - stable
+      dryRun:
+        description: "Run npm publish --dry-run instead of publishing"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  build_test_pack:
+    name: Build, test, pack tarballs
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.plan.outputs.version }}
+      npm_tag: ${{ steps.plan.outputs.npm_tag }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout vendor/react submodule (shallow)
+        run: |
+          git submodule init vendor/react
+          git submodule update --depth 1 vendor/react || git submodule update vendor/react
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Plan publish
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE_TYPE: ${{ inputs.type }}
+          INPUT_DRY_RUN: ${{ inputs.dryRun }}
+        run: |
+          set -euo pipefail
+
+          source_version="$(node -p "require('./packages/cosignal/package.json').version")"
+          short_sha="${GITHUB_SHA:0:7}"
+          dry_run="false"
+
+          case "${EVENT_NAME}" in
+            pull_request)
+              mode="ci"
+              version="${source_version}-pr-${short_sha}"
+              npm_tag=""
+              ;;
+            workflow_dispatch)
+              dry_run="${INPUT_DRY_RUN}"
+              if [ "${INPUT_RELEASE_TYPE}" = "stable" ]; then
+                mode="stable"
+                version="${source_version}"
+                npm_tag="latest"
+              else
+                mode="nightly"
+                version="${source_version}-nightly-${short_sha}"
+                npm_tag="experimental"
+              fi
+              ;;
+            *)
+              mode="nightly"
+              version="${source_version}-nightly-${short_sha}"
+              npm_tag="experimental"
+              ;;
+          esac
+
+          if [ "${mode}" != "ci" ] && [ "${dry_run}" != "true" ]; then
+            if npm view "cosignal@${version}" version >/dev/null 2>&1; then
+              echo "cosignal@${version} already exists on npm; skipping publish."
+              mode="skip"
+            fi
+          fi
+
+          {
+            echo "mode=${mode}"
+            echo "version=${version}"
+            echo "npm_tag=${npm_tag}"
+            echo "dry_run=${dry_run}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Plan: mode=${mode} version=${version} tag=${npm_tag} dry_run=${dry_run}"
+
+      - name: Cache React build dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor/react/node_modules
+          key: react-yarn-${{ env.NODE_VERSION }}-${{ hashFiles('vendor/react/yarn.lock') }}
+
+      - name: Install React build dependencies
+        run: |
+          npm install --global yarn@1
+          cd vendor/react
+          yarn install --frozen-lockfile
+
+      - name: Build patched React
+        run: ./scripts/build-react.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm --recursive build
+
+      - name: Typecheck
+        run: pnpm --recursive typecheck
+
+      - name: Test
+        run: pnpm --recursive test
+
+      - name: Pack tarballs
+        run: |
+          node scripts/prepare-npm-tarballs.mjs \
+            --version "${{ steps.plan.outputs.version }}" \
+            --out npm-tarballs \
+            --repository "https://github.com/${{ github.repository }}"
+
+      - name: Upload tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: npm-tarballs/*
+          if-no-files-found: error
+
+  smoke_tarballs:
+    name: Smoke-test tarballs with npm only
+    needs: build_test_pack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: npm-tarballs
+
+      - name: Smoke-test tarballs
+        run: node scripts/smoke-test-tarballs.mjs npm-tarballs
+
+  publish:
+    name: Publish to npm
+    needs:
+      - build_test_pack
+      - smoke_tarballs
+    if: >-
+      github.repository_owner == 'justjake' &&
+      github.event_name != 'pull_request' &&
+      contains(fromJSON('["nightly", "stable"]'), needs.build_test_pack.outputs.mode)
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Download tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: npm-tarballs
+
+      - name: Publish tarballs
+        run: |
+          set -euo pipefail
+          DRY_RUN_ARG=""
+          if [ "${{ needs.build_test_pack.outputs.dry_run }}" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+          node scripts/publish-tarballs.mjs npm-tarballs \
+            --tag "${{ needs.build_test_pack.outputs.npm_tag }}" \
+            --skip-existing \
+            $DRY_RUN_ARG
+
+      - name: Report publish
+        run: |
+          {
+            echo "### Published cosignal@${{ needs.build_test_pack.outputs.version }}"
+            echo ""
+            echo "- npm dist-tag: \`${{ needs.build_test_pack.outputs.npm_tag }}\`"
+            echo "- dry run: \`${{ needs.build_test_pack.outputs.dry_run }}\`"
+            echo "- https://www.npmjs.com/package/cosignal/v/${{ needs.build_test_pack.outputs.version }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,4 +1,4 @@
-# react-signals
+# cosignal
 
 A no-compromises signals library for React: fully concurrent (no
 `useSyncExternalStore`), transition-native, and Suspense-compatible, backed by
@@ -6,7 +6,7 @@ a minimal patch to React that exposes the render/commit lifecycle to external
 state libraries.
 
 ```tsx
-import { Atom, Computed, useSignal, useComputed, useSignalEffect } from 'react-signals';
+import { Atom, Computed, useSignal, useComputed, useSignalEffect } from 'cosignal';
 
 const count = new Atom({
   state: 0,
@@ -85,12 +85,12 @@ rebase cleanly. See `DESIGN.md` for how (and for why
 
 | Path | What |
 |---|---|
-| `packages/react-signals/src/core` | Framework-agnostic reactive graph: alien-signals-derived push-pull propagation, plus a two-plane "world" model that keeps committed and pending-transition state consistent under concurrent rendering. Zero React imports. |
-| `packages/react-signals/src/react` | `useSignal` / `useComputed` / `useSignalEffect`, the runtime that binds React's lifecycle events to the engine's worlds, and `getInstrumentedReact` (typed access to the instrumented build's add-on surface, e.g. for a MutationObserver that ignores React's own commits). |
-| `packages/react-signals/src/tracing` | Lazy-loadable causality tracing: every write/eval/notify/effect event carries its cause, answering "why did my computed re-run". Zero overhead unless imported. |
-| `packages/react-signals/src/graphviz` | Debug visualizers that emit Graphviz DOT: `dependencyGraphToDot(signals)` snapshots the live graph (per-plane values and edges while a transition is pending); `traceToDot(events)` renders a tracing session's cause chains. Loads independently of the tracing recorder. Give signals a `name` option for readable labels. |
+| `packages/cosignal/src/core` | Framework-agnostic reactive graph: alien-signals-derived push-pull propagation, plus a two-plane "world" model that keeps committed and pending-transition state consistent under concurrent rendering. Zero React imports. |
+| `packages/cosignal/src/react` | `useSignal` / `useComputed` / `useSignalEffect`, the runtime that binds React's lifecycle events to the engine's worlds, and `getInstrumentedReact` (typed access to the instrumented build's add-on surface, e.g. for a MutationObserver that ignores React's own commits). |
+| `packages/cosignal/src/tracing` | Lazy-loadable causality tracing: every write/eval/notify/effect event carries its cause, answering "why did my computed re-run". Zero overhead unless imported. |
+| `packages/cosignal/src/graphviz` | Debug visualizers that emit Graphviz DOT: `dependencyGraphToDot(signals)` snapshots the live graph (per-plane values and edges while a transition is pending); `traceToDot(events)` renders a tracing session's cause chains. Loads independently of the tracing recorder. Give signals a `name` option for readable labels. |
 | `vendor/react` (branch `react-signals-patch`) | The React patch: an external-runtime introspection channel (render-pass + commit lifecycle, DOM-mutation bracket, update-lane attribution). ~2 new files, 5 hook points, no Fiber shapes exposed. |
-| `vendor/js-reactivity-benchmark` (branch `react-signals`) | Benchmark adapter for the core graph (`testPullCounts: true`). |
+| `vendor/js-reactivity-benchmark` (branch `cosignal`) | Benchmark adapter for the core graph (`testPullCounts: true`). |
 | `DESIGN.md`, `notes/` | Architecture and the research it rests on (file:line references into React and alien-signals). |
 
 ## Setup

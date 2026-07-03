@@ -1,5 +1,5 @@
 /**
- * react-signals/graphviz — debug visualizers that emit Graphviz DOT source.
+ * cosignal/graphviz — debug visualizers that emit Graphviz DOT source.
  *
  * Both helpers return a DOT string; render it with any Graphviz tool
  * (`dot -Tsvg graph.dot -o graph.svg`, the `viz-js` package, or an online
@@ -9,7 +9,7 @@
  * Module layering (deliberate):
  * - This module imports the engine (already loaded — it *is* the library) and
  *   only the *type* of trace events, which compiles away. Loading it does NOT
- *   load the `react-signals/tracing` recorder.
+ *   load the `cosignal/tracing` recorder.
  * - The tracing module knows nothing about this one. Record events with
  *   `enableTracing()`, hand `session.events()` to `traceToDot` whenever you
  *   feel like looking at them — or never.
@@ -247,7 +247,7 @@ const EVENT_COLORS: Record<string, string> = {
 };
 
 /**
- * Renders tracing events (from `react-signals/tracing`'s
+ * Renders tracing events (from `cosignal/tracing`'s
  * `session.events()`) as a causal graph: an edge means "this event caused
  * that one". Filtered-out event types don't break chains — edges route
  * through them to the nearest rendered ancestor.

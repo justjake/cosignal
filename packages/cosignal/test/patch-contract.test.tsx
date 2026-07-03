@@ -2,7 +2,7 @@
 /**
  * CONTRACT TESTS for the React patch's batch-token protocol.
  *
- * These define the boundary between react-signals userspace and the patched
+ * These define the boundary between cosignal userspace and the patched
  * React. When the patch is rebased onto a new React version, making this file
  * pass — through real renders, with no userspace changes — is the definition
  * of "the rebase is done".

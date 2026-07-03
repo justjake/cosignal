@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the js-reactivity-benchmark suite N times for react-signals (+forked,
+# Run the js-reactivity-benchmark suite N times for cosignal (+forked,
 # +alien-signals reference), aggregate best-of-N per test, and diff against a
 # stored baseline. Only the three frameworks the diff reads are run
 # (BENCH_FRAMEWORKS filter); set BENCH_FRAMEWORKS= (empty) to run all 17.
@@ -11,7 +11,7 @@ REPEATS="${1:-3}"
 BASELINE="${2:-notes/perf/baseline.csv}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT/vendor/js-reactivity-benchmark"
-export BENCH_FRAMEWORKS="${BENCH_FRAMEWORKS-react-signals,alien-signals}"
+export BENCH_FRAMEWORKS="${BENCH_FRAMEWORKS-cosignal,alien-signals}"
 
 TMP=$(mktemp -d)
 for i in $(seq 1 "$REPEATS"); do

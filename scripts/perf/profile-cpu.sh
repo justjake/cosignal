@@ -2,7 +2,7 @@
 # CPU-profile a harness scenario and print the hottest functions.
 #   scripts/perf/profile-cpu.sh <scenario> [seconds] [topN]
 set -euo pipefail
-cd "$(dirname "$0")/../../packages/react-signals"
+cd "$(dirname "$0")/../../packages/cosignal"
 SCENARIO="${1:-steady}"
 SECONDS_ARG="${2:-10}"
 TOPN="${3:-20}"
