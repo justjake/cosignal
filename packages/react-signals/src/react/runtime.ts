@@ -12,7 +12,7 @@
  * plain-signals until a component actually subscribes.
  */
 
-import * as React from 'react';
+import { startTransition } from 'react';
 import {
   type RenderWorld,
   type BatchRef,
@@ -30,32 +30,7 @@ import {
   config,
 } from '../core/engine.ts';
 import { batch, wasExplicitlyConfigured } from '../core/api.ts';
-
-type PatchedReact = {
-  unstable_subscribeToExternalRuntime(listener: {
-    onRenderPassStart?: (container: unknown, includedBatches: readonly BatchRef[]) => void;
-    onRenderPassEnd?: (container: unknown) => void;
-    onBatchRetired?: (token: BatchRef, committed: boolean) => void;
-  }): () => void;
-  unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
-  unstable_getCurrentWriteBatch(): BatchRef;
-  unstable_isCurrentWriteDeferred(): boolean;
-};
-
-let patched: PatchedReact | null = null;
-
-function patchedReact(): PatchedReact {
-  if (patched !== null) return patched;
-  const r = React as unknown as PatchedReact;
-  if (typeof r.unstable_getCurrentWriteBatch !== 'function') {
-    throw new Error(
-      'react-signals requires the patched React build (unstable_getCurrentWriteBatch ' +
-        'is missing). See scripts/build-react.sh.',
-    );
-  }
-  patched = r;
-  return r;
-}
+import { getInstrumentedReact } from './instrumentedReact.ts';
 
 let installed = false;
 /** Component subscriptions + signal effects currently live. Gates write logging. */
@@ -77,7 +52,7 @@ export function removeConsumer(): void {
 export function ensureInstalled(): void {
   if (installed) return;
   installed = true;
-  const R = patchedReact();
+  const R = getInstrumentedReact();
 
   // Raw `atom.state` reads in render bodies are not reactive and bypass the
   // render's world; catch them in development unless the app opted out.
@@ -137,7 +112,7 @@ export function ensureInstalled(): void {
  */
 export function currentRenderWorld(): RenderWorld | null {
   if (!installed) return null;
-  const ctx = patchedReact().unstable_getRenderContext();
+  const ctx = getInstrumentedReact().unstable_getRenderContext();
   if (ctx === null) return null;
   let world = worldsByContainer.get(ctx.container);
   if (world === undefined) {
@@ -167,5 +142,5 @@ export function readInRenderWorld<T>(fn: () => T): T {
  * startSignalTransition, the same rule React applies to setState.
  */
 export function startSignalTransition(scope: () => void | Promise<void>): void {
-  React.startTransition(() => batch(scope) as void | Promise<void>);
+  startTransition(() => batch(scope) as void | Promise<void>);
 }

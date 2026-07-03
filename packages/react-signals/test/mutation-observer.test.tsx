@@ -1,14 +1,46 @@
 // @vitest-environment jsdom
+// The MutationObserver-that-ignores-React recipe, built on the instrumented
+// build's mutation window (onBeforeMutation/onAfterMutation) via the public
+// getInstrumentedReact() accessor: disconnect just before React's commit
+// mutation phase (delivering records gathered so far first) and reconnect
+// right after.
 import { afterEach, expect, test } from 'vitest';
-import * as React from 'react';
 import { act, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { observeMutationsExceptReact } from '../src/index.ts';
+import { getInstrumentedReact } from '../src/index.ts';
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const fn of cleanups.splice(0)) fn();
 });
+
+function observeMutationsExceptReact(
+  target: Node,
+  options: MutationObserverInit,
+  callback: MutationCallback,
+): () => void {
+  const observer = new MutationObserver(callback);
+  observer.observe(target, options);
+  let paused = false;
+  const unsubscribe = getInstrumentedReact().unstable_subscribeToExternalRuntime({
+    onBeforeMutation() {
+      if (paused) return;
+      paused = true;
+      const pending = observer.takeRecords();
+      if (pending.length > 0) callback(pending, observer);
+      observer.disconnect();
+    },
+    onAfterMutation() {
+      if (!paused) return;
+      paused = false;
+      observer.observe(target, options);
+    },
+  });
+  return () => {
+    unsubscribe();
+    observer.disconnect();
+  };
+}
 
 test('MutationObserver sees external mutations but not React commits', async () => {
   const host = document.createElement('div');
@@ -29,9 +61,13 @@ test('MutationObserver sees external mutations but not React commits', async () 
   expect(host.textContent).toBe('one');
 
   const records: MutationRecord[] = [];
-  const dispose = observeMutationsExceptReact(host, { childList: true, subtree: true, characterData: true }, (rs) => {
-    records.push(...rs);
-  });
+  const dispose = observeMutationsExceptReact(
+    host,
+    { childList: true, subtree: true, characterData: true },
+    (rs) => {
+      records.push(...rs);
+    },
+  );
   cleanups.push(dispose);
 
   // React-driven mutation: invisible to the observer.
