@@ -17,7 +17,7 @@ import {
   retireBatch,
   isForked,
   currentWriteSeq,
-  type BatchRef,
+  type BatchToken,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
@@ -384,19 +384,19 @@ describe('atom observed lifecycle', () => {
 });
 
 describe('worlds (deferred writes, retirement, render passes)', () => {
-  // Fake batch tokens standing in for the patch's (opaque BatchRef objects).
-  let SYNC_BATCH: BatchRef;
-  let T_BATCH: BatchRef;
+  // Fake batch tokens standing in for the patch's (opaque BatchToken objects).
+  let SYNC_BATCH: BatchToken;
+  let T_BATCH: BatchToken;
   beforeEach(() => {
     SYNC_BATCH = { deferred: false };
     T_BATCH = { deferred: true };
   });
 
-  function makeWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
+  function makeWorld(includes: readonly BatchToken[], maxSeq: number): RenderWorld {
     return { includes, maxSeq, seesDeferred: null };
   }
 
-  function withBatch<T>(token: BatchRef, fn: () => T): T {
+  function withBatch<T>(token: BatchToken, fn: () => T): T {
     setWriteBatchProvider(() => token);
     try {
       return fn();

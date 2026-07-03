@@ -41,5 +41,5 @@ export {
   getInstrumentedReact,
   type InstrumentedReact,
   type InstrumentedReactListener,
-  type BatchRef,
+  type BatchToken,
 } from './react/instrumentedReact.ts';

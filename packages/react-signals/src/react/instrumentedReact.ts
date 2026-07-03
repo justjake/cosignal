@@ -13,9 +13,9 @@
  */
 
 import * as React from 'react';
-import type { BatchRef } from '../core/engine.ts';
+import type { BatchToken } from '../core/engine.ts';
 
-export type { BatchRef };
+export type { BatchToken };
 
 export type InstrumentedReactListener = {
   /** A render pass began on `container`; `includedBatches` are the tokens of
@@ -23,7 +23,7 @@ export type InstrumentedReactListener = {
    * completing or restarting. `renderLanes` is diagnostic only. */
   onRenderPassStart?: (
     container: unknown,
-    includedBatches: readonly BatchRef[],
+    includedBatches: readonly BatchToken[],
     renderLanes: number,
   ) => void;
   /** The render pass on `container` completed or was discarded. */
@@ -37,7 +37,7 @@ export type InstrumentedReactListener = {
   onAfterMutation?: (container: unknown) => void;
   /** A batch retired — exactly once per token. `committed` is false only for
    * batches that never produced React work. */
-  onBatchRetired?: (token: BatchRef, committed: boolean) => void;
+  onBatchRetired?: (token: BatchToken, committed: boolean) => void;
 };
 
 export type InstrumentedReact = {
@@ -46,7 +46,7 @@ export type InstrumentedReact = {
   unstable_getRenderContext(): null | { container: unknown; renderLanes: number };
   /** Token identifying the batch a write issued right now belongs to
    * (minted lazily; stable for the batch's life). */
-  unstable_getCurrentWriteBatch(): BatchRef;
+  unstable_getCurrentWriteBatch(): BatchToken;
   /** Would a write right now be deferred (transition-like)? Pure, no minting. */
   unstable_isCurrentWriteDeferred(): boolean;
 };

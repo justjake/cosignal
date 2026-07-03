@@ -23,7 +23,7 @@ import {
   disposeWatcher,
   WATCHER_SUBSCRIPTION,
   currentWriteSeq,
-  type BatchRef,
+  type BatchToken,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
@@ -59,25 +59,25 @@ function controlled(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-// Fake batch tokens standing in for the patch's (opaque BatchRef objects).
+// Fake batch tokens standing in for the patch's (opaque BatchToken objects).
 // Fresh per test so retirement state doesn't leak between tests.
-let SYNC_BATCH: BatchRef;
-let T_BATCH: BatchRef;
-const createdTokens: BatchRef[] = [];
+let SYNC_BATCH: BatchToken;
+let T_BATCH: BatchToken;
+const createdTokens: BatchToken[] = [];
 beforeEach(() => {
   SYNC_BATCH = { deferred: false };
   T_BATCH = { deferred: true };
   createdTokens.push(SYNC_BATCH, T_BATCH);
 });
 
-function makeWorld(includes: readonly BatchRef[]): RenderWorld {
+function makeWorld(includes: readonly BatchToken[]): RenderWorld {
   return {
     includes,
     maxSeq: currentWriteSeq(),
     seesDeferred: null,
   };
 }
-function withBatch<T>(token: BatchRef, fn: () => T): T {
+function withBatch<T>(token: BatchToken, fn: () => T): T {
   setWriteBatchProvider(() => token);
   try {
     return fn();

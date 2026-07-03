@@ -187,14 +187,14 @@ export type Node = {
  * patch (an opaque token); the engine reads only `deferred`. Batches retire
  * exactly once via retireBatch.
  */
-export type BatchRef = { readonly deferred: boolean };
+export type BatchToken = { readonly deferred: boolean };
 
 export type WriteEntry = {
   /** For a plain set: the written value. Unused when `apply` is present. */
   value: unknown;
   /** For a functional update: pure; replayed once per world that includes it. */
   apply: ((prev: unknown) => unknown) | null;
-  batch: BatchRef;
+  batch: BatchToken;
   /** Global write ticket. */
   seq: number;
   /** 0 while the batch is pending; a fresh ticket once it retired. */
@@ -285,18 +285,18 @@ export const WORLD_HEAD: object = {};
  */
 export type RenderWorld = {
   /** Tokens of every batch this render pass includes. */
-  includes: readonly BatchRef[];
+  includes: readonly BatchToken[];
   /** Writes/retirements after this ticket are invisible to the pass. */
   maxSeq: number;
   /** Cached "does this world include a pending deferred batch"; lazy. */
   seesDeferred: boolean | null;
 };
 
-export function createRenderWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
+export function createRenderWorld(includes: readonly BatchToken[], maxSeq: number): RenderWorld {
   return { includes, maxSeq, seesDeferred: null };
 }
 
-function worldIncludesBatch(world: RenderWorld, batch: BatchRef): boolean {
+function worldIncludesBatch(world: RenderWorld, batch: BatchToken): boolean {
   const includes = world.includes;
   for (let i = 0; i < includes.length; i++) {
     if (includes[i] === batch) return true;
@@ -387,7 +387,7 @@ function checkUntrackedRenderRead(node: AtomNode | ComputedNode): void {
  * Installed by the React bindings: returns the batch token for a write
  * happening right now, or null when no React bookkeeping is needed.
  */
-export type WriteBatchProvider = () => BatchRef | null;
+export type WriteBatchProvider = () => BatchToken | null;
 let writeBatchProvider: WriteBatchProvider | null = null;
 export function setWriteBatchProvider(p: WriteBatchProvider | null): void {
   writeBatchProvider = p;
@@ -1567,7 +1567,7 @@ function appendLog(
   atom: AtomNode,
   value: unknown,
   apply: ((prev: unknown) => unknown) | null,
-  batch: BatchRef,
+  batch: BatchToken,
 ): void {
   if (atom.log === null || atom.log.length === 0) {
     atom.preLogValue = committedAtomValue(atom);
@@ -1596,7 +1596,7 @@ function appendLog(
  * the caller flush effects in a microtask instead; nothing else is held
  * open, so post-commit synchronous writes keep their own delivery context.
  */
-export function retireBatch(batch: BatchRef, deferEffectFlush = false): void {
+export function retireBatch(batch: BatchToken, deferEffectFlush = false): void {
   if (loggedAtoms.size === 0) return;
   const cause = tracer !== null ? setCurrentCause(tracer.emit('retire', currentCause)) : 0;
   const prevMuted = mutedSubscriptions;

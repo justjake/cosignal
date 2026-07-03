@@ -4,15 +4,15 @@ import {
   setWriteBatchProvider,
   retireBatch,
   isForked,
-  type BatchRef,
+  type BatchToken,
 } from '../src/core/engine.ts';
 import { enableTracing, type TracingSession } from '../src/tracing/index.ts';
 import { dependencyGraphToDot, traceToDot } from '../src/graphviz/index.ts';
 
-// Fake batch token standing in for the patch's (an opaque BatchRef object).
+// Fake batch token standing in for the patch's (an opaque BatchToken object).
 // Fresh per test so retirement state doesn't leak between tests.
-let T_BATCH: BatchRef;
-const createdTokens: BatchRef[] = [];
+let T_BATCH: BatchToken;
+const createdTokens: BatchToken[] = [];
 beforeEach(() => {
   T_BATCH = { deferred: true };
   createdTokens.push(T_BATCH);

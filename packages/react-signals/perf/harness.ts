@@ -38,7 +38,7 @@ import {
   subscribeTo,
   disposeWatcher,
   WATCHER_SUBSCRIPTION,
-  type BatchRef,
+  type BatchToken,
 } from '../src/core/engine.ts';
 
 const scenario = process.argv[2] ?? 'steady';
@@ -77,7 +77,7 @@ function buildGraph(width: number): Atom<number>[] {
 }
 
 /** Runs `write` attributed to `token`, as the React provider would. */
-function writeInBatch(token: BatchRef, write: () => void): void {
+function writeInBatch(token: BatchToken, write: () => void): void {
   setWriteBatchProvider(() => token);
   try {
     write();
@@ -120,7 +120,7 @@ switch (scenario) {
   case 'forked': {
     // Enter forked mode permanently: one deferred write that never retires.
     const pin = new Atom({ state: 0 });
-    const deferredBatch: BatchRef = { deferred: true };
+    const deferredBatch: BatchToken = { deferred: true };
     writeInBatch(deferredBatch, () => pin.set(1));
     const sources = buildGraph(50);
     let n = 0;
@@ -142,7 +142,7 @@ switch (scenario) {
     let notifications = 0;
     const w = createWatcher(WATCHER_SUBSCRIPTION, null, () => void notifications++);
     subscribeTo(w, c.node);
-    const immediateBatch: BatchRef = { deferred: false };
+    const immediateBatch: BatchToken = { deferred: false };
     setWriteBatchProvider(() => immediateBatch);
     let n = 0;
     run('handler', () => {
@@ -159,7 +159,7 @@ switch (scenario) {
     const b = new Atom({ state: 100 });
     const sum = new Computed({ fn: () => (a.state as number) + (b.state as number) });
     const dispose = effect(() => void sum.state);
-    const deferredBatch: BatchRef = { deferred: true };
+    const deferredBatch: BatchToken = { deferred: true };
     writeInBatch(deferredBatch, () => a.set(1)); // fork; a has a pending deferred entry
     const world = createRenderWorld([deferredBatch], currentWriteSeq());
     pinRenderPass(world.maxSeq);
@@ -178,7 +178,7 @@ switch (scenario) {
     const sources = buildGraph(20);
     let n = 0;
     run('retire', () => {
-      const token: BatchRef = { deferred: true };
+      const token: BatchToken = { deferred: true };
       writeInBatch(token, () => sources[n % 20]!.set(n));
       retireBatch(token);
       n++;

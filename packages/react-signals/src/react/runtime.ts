@@ -15,7 +15,7 @@
 import { startTransition } from 'react';
 import {
   type RenderWorld,
-  type BatchRef,
+  type BatchToken,
   createRenderWorld,
   isForked,
   hasActivePins,
@@ -38,7 +38,7 @@ let consumerCount = 0;
 /** Render worlds for in-flight passes, keyed by root container. */
 const worldsByContainer = new Map<unknown, RenderWorld>();
 
-const EMPTY_BATCHES: readonly BatchRef[] = [];
+const EMPTY_BATCHES: readonly BatchToken[] = [];
 
 export function addConsumer(): void {
   ensureInstalled();

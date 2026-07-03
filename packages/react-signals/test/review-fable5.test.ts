@@ -19,19 +19,19 @@ import {
   disposeWatcher,
   writeAtom,
   WATCHER_SUBSCRIPTION,
-  type BatchRef,
+  type BatchToken,
 } from '../src/core/engine.ts';
 
-// Fake batch token standing in for the patch's (an opaque BatchRef object).
+// Fake batch token standing in for the patch's (an opaque BatchToken object).
 // Fresh per test so retirement state doesn't leak between tests.
-let T_BATCH: BatchRef;
-const createdTokens: BatchRef[] = [];
+let T_BATCH: BatchToken;
+const createdTokens: BatchToken[] = [];
 beforeEach(() => {
   T_BATCH = { deferred: true };
   createdTokens.push(T_BATCH);
 });
 
-function withBatch<T>(token: BatchRef, fn: () => T): T {
+function withBatch<T>(token: BatchToken, fn: () => T): T {
   setWriteBatchProvider(() => token);
   try {
     return fn();

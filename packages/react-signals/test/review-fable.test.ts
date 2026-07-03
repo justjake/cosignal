@@ -18,16 +18,16 @@ import {
   createWatcher,
   subscribeTo,
   WATCHER_SUBSCRIPTION,
-  type BatchRef,
+  type BatchToken,
   type RenderWorld,
 } from '../src/core/engine.ts';
 
-// Fake batch tokens standing in for the patch's (opaque BatchRef objects).
+// Fake batch tokens standing in for the patch's (opaque BatchToken objects).
 // Fresh per test so retirement state doesn't leak between tests.
-let SYNC_BATCH: BatchRef;
-let T_BATCH: BatchRef;
-let T2_BATCH: BatchRef;
-const createdTokens: BatchRef[] = [];
+let SYNC_BATCH: BatchToken;
+let T_BATCH: BatchToken;
+let T2_BATCH: BatchToken;
+const createdTokens: BatchToken[] = [];
 beforeEach(() => {
   SYNC_BATCH = { deferred: false };
   T_BATCH = { deferred: true };
@@ -35,7 +35,7 @@ beforeEach(() => {
   createdTokens.push(SYNC_BATCH, T_BATCH, T2_BATCH);
 });
 
-function makeWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
+function makeWorld(includes: readonly BatchToken[], maxSeq: number): RenderWorld {
   return {
     includes,
     maxSeq,
@@ -43,7 +43,7 @@ function makeWorld(includes: readonly BatchRef[], maxSeq: number): RenderWorld {
   };
 }
 
-function withBatch<T>(token: BatchRef, fn: () => T): T {
+function withBatch<T>(token: BatchToken, fn: () => T): T {
   setWriteBatchProvider(() => token);
   try {
     return fn();
